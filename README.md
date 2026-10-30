@@ -131,8 +131,8 @@ Total ≈ 9–10 h. No scope cuts; the deadline moves instead.
 
 ## 7. Risks and open questions
 
-- **Probabilities from KServe:** `PREDICT_PROBA` is unverified for v0.21. Checked in the Phase 0 spike; fallback is a custom predictor (KServe `Model` subclass) in `churn-base`.
-- **Raw input at serving:** mixed strings/numbers in a numpy array may be cast to strings. Checked in the Phase 0 spike; fallback is casting numerics inside the sklearn `Pipeline` (a `FunctionTransformer`) or the custom predictor.
+- **Probabilities from KServe:** verified in the Phase 0 spike (SPEC 02). With `PREDICT_PROBA=true`, `kserve-sklearnserver` v0.21 returns `{"predictions": [[p0, p1], ...]}`; the churn probability is the second column. No custom predictor is needed.
+- **Raw input at serving:** verified in the Phase 0 spike (SPEC 02). Rows with strings and numbers in `FEATURES` order are scored correctly by a sklearn `Pipeline` with a position-based `ColumnTransformer`, and the answer matches the local `predict_proba` (maximum difference 0). No `FunctionTransformer` is needed.
 - **scikit-learn version pinning:** read the version from the KServe 0.21 sklearnserver image before building `churn-base`.
 - **SQLite under parallel writes:** possible `database is locked` with concurrent tuning runs (Optuna adds one MLflow run per trial, ~90 runs per pipeline run). Mitigation: parallelism 2 and client retries; fallback Postgres.
 - **Metrics from KServe sklearn server:** unverified that v0.21 exposes Prometheus metrics in Standard mode. First check in Phase 3; fallback is the custom predictor exporting request count and latency.
