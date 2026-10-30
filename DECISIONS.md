@@ -19,3 +19,4 @@ Single source of the frozen contracts. Changing a row needs a new line in the lo
 
 - **2026-10-30 (SPEC 01):** contracts above written from README §2 and §5. `SEED = 42` chosen because the README asked for a fixed seed without a value.
 - **2026-10-30 (SPEC 01, E0.2):** scikit-learn pinned to `1.5.2` and Python to `3.11`, read from the sklearnserver image (see `docs/runbook.md`). The server also ships numpy 2.4.4, which SPEC 02 must verify against a model pickled by `churn-base`.
+- **2026-10-30 (SPEC 01, E0.4/Python env):** runtime depends on `mlflow-skinny` instead of `mlflow`. The full package pulls `matplotlib` into the image, which the spec keeps in the `dev` group only. The MLflow server (E1) uses its own image, so it is unaffected. `skops` is added explicitly as a runtime dependency: `mlflow.sklearn.save_model` imports it (MLflow's default, safer-than-pickle format) and only the full package pulled it in. Verified with a `save_model`/`load_model` roundtrip.
