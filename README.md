@@ -119,6 +119,15 @@ Pipeline([
 
 Total ≈ 9–10 h. No scope cuts; the deadline moves instead.
 
+## Baseline results
+
+5-fold stratified CV (`SEED = 42`) on all of `data/train.csv`, ROC-AUC, from `tools/baseline.py`:
+
+| Model | Mean | Std |
+|---|---|---|
+| `DummyClassifier(strategy="prior")` | 0.5000 | 0.0000 |
+| LogReg behind a position-based `ColumnTransformer` | 0.8789 | 0.0110 |
+
 ## 7. Risks and open questions
 
 - **Probabilities from KServe:** `PREDICT_PROBA` is unverified for v0.21. Checked in the Phase 0 spike; fallback is a custom predictor (KServe `Model` subclass) in `churn-base`.
