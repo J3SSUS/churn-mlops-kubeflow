@@ -1,0 +1,16 @@
+# Kaggle data: learning use only, never publish
+*.csv
+*.zip
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Local outputs
+*.joblib
+*.pkl
+pipelines/*.yaml
+mlruns/
+
+BACKLOG.md
