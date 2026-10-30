@@ -1,0 +1,19 @@
+# Helper pod used once to copy the CSVs into the churn-data PVC. Delete it afterwards.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: data-loader
+  namespace: kubeflow
+spec:
+  restartPolicy: Never
+  containers:
+    - name: loader
+      image: busybox:1.37
+      command: ["sleep", "3600"]
+      volumeMounts:
+        - name: data
+          mountPath: /mnt/data
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: churn-data

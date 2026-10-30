@@ -1,0 +1,17 @@
+[project]
+name = "churn-mlops"
+version = "0.1.0"
+description = "Bank customer churn: end-to-end MLOps on Kubeflow"
+readme = "README.md"
+requires-python = "==3.11.*"
+dependencies = [
+    "scikit-learn==1.5.2",
+    "mlflow-skinny",
+    "skops",
+    "optuna",
+    "pandas",
+    "joblib",
+]
+
+[dependency-groups]
+dev = ["jupyter", "matplotlib"]
