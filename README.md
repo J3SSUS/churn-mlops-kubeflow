@@ -1,6 +1,6 @@
 # Bank Customer Churn — End-to-End MLOps on Kubeflow
 
-> Status: **draft v0.2 for review.** Nothing is built yet; this document fixes scope and architecture so we can iterate before writing code.
+![Status: in progress](https://img.shields.io/badge/status-in%20progress-yellow)
 
 ## 1. Goal
 
