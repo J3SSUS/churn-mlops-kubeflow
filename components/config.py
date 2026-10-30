@@ -1,3 +1,5 @@
+"""Shared contract for the churn project: frozen FEATURES order, column indices,
+target, seed and PVC paths. Columns are always addressed by position."""
 FEATURES = [
     "CreditScore", "Geography", "Gender", "Age", "Tenure",
     "Balance", "NumOfProducts", "HasCrCard", "IsActiveMember", "EstimatedSalary",

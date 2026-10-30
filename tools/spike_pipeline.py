@@ -1,3 +1,7 @@
+"""Throwaway sklearn Pipeline shared by tools/baseline.py and the serving spike.
+
+One-hot for the categorical columns, scaling for the numeric ones, then LogReg.
+Not the final build_preprocessor() of E2.3."""
 from sklearn.compose import ColumnTransformer
 from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
