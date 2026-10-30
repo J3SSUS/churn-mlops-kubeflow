@@ -1,6 +1,6 @@
 # SPEC 02 — Baseline, EDA and serving spike
 
-> **Status:** Approved
+> **Status:** Implemented.
 > **Depends on:** SPEC 01
 > **Backlog:** E0 (Setup and serving spike), tasks E0.6–E0.7 of `BACKLOG.md`; E2.1 pulled forward in a minimal form
 > **Date:** 2026-10-30
