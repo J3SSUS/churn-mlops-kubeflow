@@ -90,3 +90,25 @@ Gotchas:
 - `minikube image build` builds inside minikube, so the image does not show in the host's `docker images`. Check with `minikube image ls`.
 - The tag goes up (`0.1.1`, ...) whenever `pyproject.toml` or the `Dockerfile` changes. Pods use `IfNotPresent`, so reusing a tag would keep the stale image.
 - The image has Python 3.11.18; the sklearnserver has 3.11.16. Same minor version, so pickles stay compatible.
+
+## Data PVC (SPEC 01, E0.5)
+
+PVC `churn-data` (2Gi, `ReadWriteOnce`, storageClass `standard`) in `kubeflow`, mounted at `/mnt/data`. A helper pod copies the CSVs from `data/` to `/mnt/data/raw/` and is deleted afterwards.
+
+```bash
+kubectl apply -f k8s/pvc-churn-data.yaml -f k8s/data-loader-pod.yaml
+kubectl wait --for=condition=Ready pod/data-loader -n kubeflow --timeout=120s
+kubectl exec -n kubeflow data-loader -- mkdir -p /mnt/data/raw
+for f in train test sample_submission; do kubectl cp data/$f.csv kubeflow/data-loader:/mnt/data/raw/$f.csv; done
+kubectl exec -n kubeflow data-loader -- ls -l /mnt/data/raw
+kubectl exec -n kubeflow data-loader -- sh -c 'cd /mnt/data/raw && wc -l *.csv'    # 10001 sample_submission, 10001 test, 15001 train
+kubectl delete pod data-loader -n kubeflow                                          # the PVC stays
+kubectl get pvc churn-data -n kubeflow                                              # Bound, 2Gi
+```
+
+Observed: the PVC was `Bound` in seconds; the 3 files match the local `md5` checksums.
+
+Gotchas:
+
+- The PVC uses minikube's hostpath provisioner (`Delete` reclaim policy), so `minikube delete` or deleting the PVC loses the data. Reload it by re-running the commands above; the CSVs stay in `data/`.
+- Pods can only mount a PVC from their own namespace, so everything that needs `churn-data` runs in `kubeflow`.
