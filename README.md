@@ -24,6 +24,7 @@ Everything runs locally on minikube (Apple Silicon Mac, Docker Desktop), on top 
 - **Dropped:** `id`, `CustomerId`, `Surname` (identifiers / noise). `id` is kept aside only to build the submission.
 - **Metric:** ROC-AUC (main), plus PR-AUC, recall, F1 and confusion matrix. Accuracy is not used for decisions (20 % positives). Competition metric not confirmed from the page; assumed ROC-AUC.
 - **Data policy:** for learning only, never published or committed (see `.gitignore`).
+- **EDA:** key findings with charts in [`docs/eda-summary.md`](docs/eda-summary.md); the full analysis is in `notebooks/eda.ipynb`.
 
 ## 3. Scope
 
@@ -150,6 +151,7 @@ portafolio/kubeflow/
 ├── data/                      # train.csv  test.csv  sample_submission.csv (git-ignored)
 ├── docker/churn-base/         # Dockerfile + requirements.txt (pinned)
 ├── k8s/                       # PVC, MLflow, InferenceService, load-generator Job, Helm values
+├── notebooks/eda.ipynb        # exploratory analysis, committed with aggregated outputs only
 ├── components/                # KFP components: ingest, preprocess, tune, evaluate, register, fetch, publish, smoke_test
 ├── pipelines/
 │   ├── training_pipeline.py   # Pipeline 1
