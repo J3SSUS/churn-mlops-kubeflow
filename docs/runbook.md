@@ -112,3 +112,68 @@ Gotchas:
 
 - The PVC uses minikube's hostpath provisioner (`Delete` reclaim policy), so `minikube delete` or deleting the PVC loses the data. Reload it by re-running the commands above; the CSVs stay in `data/`.
 - Pods can only mount a PVC from their own namespace, so everything that needs `churn-data` runs in `kubeflow`.
+
+## Serving spike (SPEC 02, E0.7)
+
+Goal: check how a sklearn `Pipeline` trained in `churn-base:0.1.0` answers raw rows on a temporary KServe InferenceService. Everything below was deleted at the end.
+
+```bash
+# 1. Train in a churn-base pod (the code travels in a ConfigMap, the image is not rebuilt)
+kubectl create configmap spike-code -n kubeflow --from-file=components/config.py \
+  --from-file=tools/spike_pipeline.py --from-file=tools/spike_train.py --dry-run=client -o yaml | kubectl apply -f -
+kubectl apply -f k8s/spike-train-pod.yaml
+kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pod/spike-train -n kubeflow --timeout=180s
+kubectl logs spike-train -n kubeflow | grep '^REFERENCE ' | sed 's/^REFERENCE //' > spike-reference.json   # git-ignored
+kubectl exec -n kubeflow data-loader -- ls -la /mnt/data/models/spike/v1                                    # only model.joblib
+
+# 2. Deploy and wait
+kubectl apply -f k8s/spike-inferenceservice.yaml
+kubectl wait --for=condition=Ready isvc/churn-spike -n kubeflow --timeout=300s
+
+# 3. Query (use another local port if 8080 is taken)
+kubectl port-forward -n kubeflow svc/churn-spike-predictor 8080:80
+uv run python tools/spike_query.py            # or: uv run python tools/spike_query.py 18080
+```
+
+Facts recorded before the InferenceService was created:
+
+- The training pod ran `churn-base:0.1.0` (Python 3.11.18, scikit-learn 1.5.2, joblib 1.6.0, numpy 2.4.6).
+- `models/spike/v1/` held exactly one file, `model.joblib` (2,990 bytes).
+- `spike-reference.json` held 3 instances of 10 values each, with strings at positions 1 and 2 (Geography, Gender), plus 3 rows of `expected`.
+
+### Findings
+
+| Question | Answer (yes/no) | Evidence |
+|---|---|---|
+| `PREDICT_PROBA=true` returns probabilities | yes | HTTP 200, `{"predictions":[[0.7844881096085148,0.21551189039148516],[0.924457286540825,0.07554271345917493],[0.5147346067488787,0.4852653932511213]]}` |
+| A raw row with strings and numbers keeps its types and is scored | yes | The 3 rows with `"Germany"`/`"France"` and `"Male"`/`"Female"` at positions 1 and 2 returned 200 with no error, and the probabilities equal the local ones |
+| The model loads and matches the local `predict_proba` despite the numpy/Python patch differences | yes | Maximum absolute difference `0.000e+00` (threshold `1e-6`). Pod: Python 3.11.18, numpy 2.4.6. Server: Python 3.11.16, numpy 2.4.4 |
+| It runs in Standard mode with the explicit `kserve-sklearnserver` runtime | yes | `kubectl get isvc churn-spike -n kubeflow` showed `READY=True`; runtime `kserve-sklearnserver`, deployment mode `Standard`, predictor pod `1/1 Running` with image `kserve/sklearnserver:v0.21.0`; the log ends with `Application startup complete` |
+
+Real answer shape (`tools/spike_query.py` output):
+
+```text
+status: 200
+predictions shape: (3, 2)
+max abs diff vs expected: 0.000e+00
+```
+
+- `predictions` is a list with one `[p0, p1]` pair per instance. **The churn probability is the second column, `p1`.** E3.4 and E4.4 must read `predictions[i][1]`.
+- The request is `{"instances": [[649.0, "Germany", "Male", 37.0, 3.0, 106534.4, 1.0, 1.0, 1.0, 131173.9], ...]}`: numbers as floats, strings as strings, in `FEATURES` order.
+
+Gotchas:
+
+- If another process holds local port 8080 (for example the KFP UI port-forward from the cluster section), a `POST` to `localhost:8080` reaches that process and returns an HTML `404 Cannot POST`. Forward the predictor to a free port and pass it to `spike_query.py`.
+- `sklearnserver` takes exactly one `.joblib`, `.pkl` or `.pickle` file per model folder, so nothing else may go in `models/spike/v1/`.
+- Pods are immutable: after editing a spike script, recreate the ConfigMap and delete `spike-train` before running it again.
+
+### Cleanup
+
+```bash
+kubectl delete -f k8s/spike-inferenceservice.yaml
+kubectl delete pod spike-train -n kubeflow
+kubectl delete configmap spike-code -n kubeflow
+kubectl exec -n kubeflow data-loader -- rm -rf /mnt/data/models
+kubectl exec -n kubeflow data-loader -- ls /mnt/data                    # only raw
+kubectl delete pod data-loader -n kubeflow
+```

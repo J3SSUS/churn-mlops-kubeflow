@@ -14,3 +14,5 @@ pipelines/*.yaml
 mlruns/
 
 BACKLOG.md
+# Spike reference rows (from test.csv)
+spike-reference.json

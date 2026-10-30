@@ -1,6 +1,6 @@
 # SPEC 01 — Project foundation
 
-> **Status:** Approved
+> **Status:** Implemented.
 > **Depends on:** —
 > **Backlog:** E0 (Setup and serving spike), tasks E0.1–E0.5 of `BACKLOG.md`
 > **Date:** 2026-10-30

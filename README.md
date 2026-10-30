@@ -24,6 +24,7 @@ Everything runs locally on minikube (Apple Silicon Mac, Docker Desktop), on top 
 - **Dropped:** `id`, `CustomerId`, `Surname` (identifiers / noise). `id` is kept aside only to build the submission.
 - **Metric:** ROC-AUC (main), plus PR-AUC, recall, F1 and confusion matrix. Accuracy is not used for decisions (20 % positives). Competition metric not confirmed from the page; assumed ROC-AUC.
 - **Data policy:** for learning only, never published or committed (see `.gitignore`).
+- **EDA:** key findings with charts in [`docs/eda-summary.md`](docs/eda-summary.md); the full analysis is in `notebooks/eda.ipynb`.
 
 ## 3. Scope
 
@@ -119,10 +120,19 @@ Pipeline([
 
 Total ≈ 9–10 h. No scope cuts; the deadline moves instead.
 
+## Baseline results
+
+5-fold stratified CV (`SEED = 42`) on all of `data/train.csv`, ROC-AUC, from `tools/baseline.py`:
+
+| Model | Mean | Std |
+|---|---|---|
+| `DummyClassifier(strategy="prior")` | 0.5000 | 0.0000 |
+| LogReg behind a position-based `ColumnTransformer` | 0.8789 | 0.0110 |
+
 ## 7. Risks and open questions
 
-- **Probabilities from KServe:** `PREDICT_PROBA` is unverified for v0.21. Checked in the Phase 0 spike; fallback is a custom predictor (KServe `Model` subclass) in `churn-base`.
-- **Raw input at serving:** mixed strings/numbers in a numpy array may be cast to strings. Checked in the Phase 0 spike; fallback is casting numerics inside the sklearn `Pipeline` (a `FunctionTransformer`) or the custom predictor.
+- **Probabilities from KServe:** verified in the Phase 0 spike (SPEC 02). With `PREDICT_PROBA=true`, `kserve-sklearnserver` v0.21 returns `{"predictions": [[p0, p1], ...]}`; the churn probability is the second column. No custom predictor is needed.
+- **Raw input at serving:** verified in the Phase 0 spike (SPEC 02). Rows with strings and numbers in `FEATURES` order are scored correctly by a sklearn `Pipeline` with a position-based `ColumnTransformer`, and the answer matches the local `predict_proba` (maximum difference 0). No `FunctionTransformer` is needed.
 - **scikit-learn version pinning:** read the version from the KServe 0.21 sklearnserver image before building `churn-base`.
 - **SQLite under parallel writes:** possible `database is locked` with concurrent tuning runs (Optuna adds one MLflow run per trial, ~90 runs per pipeline run). Mitigation: parallelism 2 and client retries; fallback Postgres.
 - **Metrics from KServe sklearn server:** unverified that v0.21 exposes Prometheus metrics in Standard mode. First check in Phase 3; fallback is the custom predictor exporting request count and latency.
@@ -141,6 +151,7 @@ portafolio/kubeflow/
 ├── data/                      # train.csv  test.csv  sample_submission.csv (git-ignored)
 ├── docker/churn-base/         # Dockerfile + requirements.txt (pinned)
 ├── k8s/                       # PVC, MLflow, InferenceService, load-generator Job, Helm values
+├── notebooks/eda.ipynb        # exploratory analysis, committed with aggregated outputs only
 ├── components/                # KFP components: ingest, preprocess, tune, evaluate, register, fetch, publish, smoke_test
 ├── pipelines/
 │   ├── training_pipeline.py   # Pipeline 1

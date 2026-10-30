@@ -1,0 +1,17 @@
+# Temporary InferenceService for the serving spike (SPEC 02). Delete it afterwards.
+# The cluster default deployment mode is already Standard, so no mode annotation is set.
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: churn-spike
+  namespace: kubeflow
+spec:
+  predictor:
+    model:
+      modelFormat:
+        name: sklearn
+      runtime: kserve-sklearnserver
+      storageUri: pvc://churn-data/models/spike/v1
+      env:
+        - name: PREDICT_PROBA
+          value: "true"
