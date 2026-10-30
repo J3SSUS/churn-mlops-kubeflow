@@ -1,0 +1,29 @@
+# Temporary pod for the serving spike (SPEC 02). Trains the throwaway model on the PVC.
+# The code comes from the ConfigMap spike-code. Delete the pod and the ConfigMap afterwards.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: spike-train
+  namespace: kubeflow
+spec:
+  restartPolicy: Never
+  containers:
+    - name: train
+      image: churn-base:0.1.0
+      imagePullPolicy: IfNotPresent
+      command: ["python", "/code/spike_train.py"]
+      env:
+        - name: PYTHONPATH
+          value: /code
+      volumeMounts:
+        - name: data
+          mountPath: /mnt/data
+        - name: code
+          mountPath: /code
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: churn-data
+    - name: code
+      configMap:
+        name: spike-code
