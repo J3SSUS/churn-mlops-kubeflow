@@ -50,6 +50,13 @@ spec:
             - --artifacts-destination
             - /mlflow/artifacts
             - --serve-artifacts
+            - --workers
+            - "1"
+            - --allowed-hosts
+            - "mlflow.mlflow.svc.cluster.local:5000,mlflow.mlflow.svc.cluster.local,localhost:*,127.0.0.1:*"
+          env:
+            - name: MLFLOW_SERVER_ENABLE_JOB_EXECUTION
+              value: "false"
           ports:
             - containerPort: 5000
           readinessProbe:

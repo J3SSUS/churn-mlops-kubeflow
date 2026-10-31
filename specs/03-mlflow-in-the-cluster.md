@@ -22,7 +22,7 @@ Two things are not obvious:
 - **E1.1 Manifests:** `k8s/mlflow.yaml` with four objects.
   - Namespace `mlflow`.
   - PVC `mlflow-data`: 2Gi, `ReadWriteOnce`, storageClass `standard`.
-  - Deployment `mlflow`: image `ghcr.io/mlflow/mlflow:v3.17.2`, 1 replica, `strategy: Recreate`, small resource requests and limits, a readiness probe on `/health`. It runs `mlflow server --serve-artifacts` with SQLite and the artifacts on the PVC.
+  - Deployment `mlflow`: image `ghcr.io/mlflow/mlflow:v3.17.2`, 1 replica, `strategy: Recreate`, small resource requests and limits, a readiness probe on `/health`. It runs `mlflow server --serve-artifacts --workers 1` with SQLite and the artifacts on the PVC, and `MLFLOW_SERVER_ENABLE_JOB_EXECUTION=false`.
   - Service `mlflow` on port 5000.
 - **E1.2 Deploy and UI:** apply, wait for `Available`, `kubectl port-forward` to a free local port (5001) and open the UI.
 - **E1.3 Connectivity test:** a pod in `kubeflow` with `churn-base:0.1.0` logs a run with a param, a metric and one small artifact to `http://mlflow.mlflow.svc.cluster.local:5000`, in the experiment `connectivity-test`.
@@ -61,7 +61,11 @@ mlflow server --host 0.0.0.0 --port 5000
   --backend-store-uri sqlite:////mlflow/mlflow.db
   --artifacts-destination /mlflow/artifacts
   --serve-artifacts
+  --workers 1
+  --allowed-hosts mlflow.mlflow.svc.cluster.local:5000,mlflow.mlflow.svc.cluster.local,localhost:*,127.0.0.1:*
 ```
+
+The Deployment also sets the env var `MLFLOW_SERVER_ENABLE_JOB_EXECUTION=false`.
 
 - The client only needs `MLFLOW_TRACKING_URI`. Artifacts travel over HTTP, so pods in `kubeflow` need no access to the `mlflow-data` volume.
 - The client in `churn-base` is `mlflow-skinny 3.17.2`, the same version as the server.
@@ -170,6 +174,8 @@ The pod `mlflow-check` runs `sleep`, and each mode is a `kubectl exec ... python
 - **No:** sharing the PVC with `kubeflow`, because a pod can only mount a PVC from its own namespace. **No** S3 or MinIO either: no credentials, and one more component to run.
 - **Yes:** namespace `mlflow`, PVC of 2Gi (`ReadWriteOnce`, `standard`) and `strategy: Recreate`. A `RollingUpdate` would leave two pods fighting for a RWO volume.
 - **Yes:** requests of 256Mi memory and 100m CPU, and a memory limit of 1Gi. The node has about 8 GB and KFP, KServe and later Prometheus share it. The numbers are an estimate, adjusted in step 2 if the server exceeds them.
+- **Yes:** `--workers 1` and `MLFLOW_SERVER_ENABLE_JOB_EXECUTION=false`, added in step 2. With the defaults, MLflow 3.17.2 starts several uvicorn workers and about 6 `huey` job consumers (about 160 MB each). That was over 1.5 GB: the container was `OOMKilled` at 1Gi, and at 2Gi it left the node thrashing. Nothing in this project needs the job executor. The memory limit goes back to 1Gi.
+- **Yes:** `--allowed-hosts mlflow.mlflow.svc.cluster.local:5000,mlflow.mlflow.svc.cluster.local,localhost:*,127.0.0.1:*`, added in step 3. MLflow 3.17.2 refused the in-cluster host name with 403 "Invalid Host header" (the risk listed below). The `localhost` entries keep the port-forward working. **No** `*`.
 - **Yes:** readiness probe on `/health`. `kubectl wait` then means the server really answers.
 - **Yes:** the local UI goes through `port-forward` on port 5001. Port 8080 is held by another port-forward in this setup, and 5000 is commonly taken by the AirPlay Receiver on macOS.
 - **Yes:** `tools/mlflow_check.py` shipped through a ConfigMap to one `sleep` pod, with `kubectl exec` per mode. It follows the SPEC 02 pattern, so the image is not rebuilt. The pod survives between steps, so the UI can be checked before the cleanup.
