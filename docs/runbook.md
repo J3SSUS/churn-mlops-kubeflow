@@ -177,3 +177,52 @@ kubectl exec -n kubeflow data-loader -- rm -rf /mnt/data/models
 kubectl exec -n kubeflow data-loader -- ls /mnt/data                    # only raw
 kubectl delete pod data-loader -n kubeflow
 ```
+
+## MLflow (SPEC 03, E1)
+
+Goal: run an MLflow tracking server with model registry in the `mlflow` namespace, and check that a `churn-base` pod in `kubeflow` can log a run with an artifact and register, alias and load a test model. The server, its PVC and its Service stay installed (E2 builds on them). Everything else below was deleted at the end.
+
+```bash
+# 1. Deploy and wait (server 3.17.2, official image, SQLite + artifacts on the PVC)
+kubectl apply -f k8s/mlflow.yaml
+kubectl wait --for=condition=Available deploy/mlflow -n mlflow --timeout=300s
+
+# 2. UI on a free local port (8080 is held by the KFP UI port-forward, 5000 by AirPlay on macOS)
+kubectl port-forward -n mlflow svc/mlflow 5001:5000
+curl http://localhost:5001/health                       # OK
+
+# 3. Check pod (the code travels in a ConfigMap, the image is not rebuilt)
+kubectl create configmap mlflow-check-code -n kubeflow --from-file=tools/mlflow_check.py
+kubectl apply -f k8s/mlflow-check-pod.yaml
+kubectl wait --for=condition=Ready pod/mlflow-check -n kubeflow --timeout=120s
+kubectl exec -n kubeflow mlflow-check -- python /code/mlflow_check.py connectivity
+kubectl exec -n mlflow deploy/mlflow -- find /mlflow/artifacts -type f
+
+# 4. Registry (recreate the ConfigMap and the pod first if the script changed)
+kubectl exec -n kubeflow mlflow-check -- python /code/mlflow_check.py registry
+
+# 5. Cleanup of the test objects (the server stays)
+kubectl exec -n kubeflow mlflow-check -- python /code/mlflow_check.py cleanup
+kubectl delete pod mlflow-check -n kubeflow
+kubectl delete configmap mlflow-check-code -n kubeflow
+```
+
+Observed:
+
+- The official image `ghcr.io/mlflow/mlflow:v3.17.2` runs on arm64 (no `exec format error`).
+- The PVC `mlflow-data` was `Bound` with 2Gi, the Deployment `1/1`, and `/health` answered `OK`.
+- `connectivity` exited 0, printed a run id and the artifact URI `mlflow-artifacts:/1/<run id>/artifacts`, and read `hello.txt` back with the same content. The run held the param `check=connectivity` and the metric `answer=42.0` (read through the API). `hello.txt` was in `/mlflow/artifacts/1/<run id>/artifacts/` on the server's PVC, so the artifact travelled through the server and not through a client-side write.
+- `registry` printed `model version: 1` and `max absolute difference: 0.0`. The registry held only `registry-test`, with the alias `check` on version 1 (read through the API). The `mlflow-skinny` client in `churn-base` needed nothing extra.
+- UI check: the runs of `connectivity-test` were seen in the UI at `http://localhost:5001` before the cleanup, and they had run correctly. No screenshot was kept, because the cleanup deleted them afterwards. The model `registry-test` and its alias were verified through the API only.
+- After `cleanup` the registry was empty, `connectivity-test` was in the `deleted` stage, no `mlflow-check*` object was left in `kubeflow`, and the server pod, the PVC and the Service were still there.
+
+Gotchas:
+
+- **Memory:** with its defaults MLflow 3.17.2 starts several uvicorn workers and about 6 `huey` job consumers (about 160 MB each), over 1.5 GB in total. At a 1Gi limit the pod was `OOMKilled` (`CrashLoopBackOff`, exit 137), and at 2Gi it pushed the 8 GB node into thrashing (load above 60, `kubectl` and `minikube status` timing out) until `minikube stop && minikube start`. The manifest runs `--workers 1` and `MLFLOW_SERVER_ENABLE_JOB_EXECUTION=false`, and the pod uses about 550 MB with a 1Gi limit. If `kubectl` hangs, `docker exec minikube sh -c "top -b -n 1 -o %CPU | head"` shows what is eating the node. After a minikube restart a few controllers show `Error` or `CrashLoopBackOff` for a minute and recover alone.
+- **Host header:** MLflow 3.x validates it and answers `403 Invalid Host header - possible DNS rebinding attack detected` to `mlflow.mlflow.svc.cluster.local:5000`. The server runs with `--allowed-hosts mlflow.mlflow.svc.cluster.local:5000,mlflow.mlflow.svc.cluster.local,localhost:*,127.0.0.1:*` (see `DECISIONS.md`). Any other in-cluster name needs adding there.
+- **Soft deletes:** the API cleanup leaves the experiment `connectivity-test` and its runs as soft-deleted rows (no `mlflow gc`), so that name cannot be reused. To re-run the checks, change `EXPERIMENT` in `tools/mlflow_check.py`.
+- **Client noise:** the `churn-base` image has no `git`, so the client prints a `GIT_PYTHON_REFRESH` warning. It is harmless.
+- **Port-forward:** it dies when the server pod is replaced (any `kubectl apply` that changes the Deployment). Start it again.
+- **Local `curl` with query strings:** quote the URL in zsh (`curl 'http://localhost:5001/api/...?name=x'`), or the `?` is taken as a glob.
+- The PVC uses minikube's hostpath provisioner, so `minikube delete` loses every run and model. E2 can recreate them.
+- Pods are immutable: after editing `mlflow_check.py`, recreate the ConfigMap and delete `mlflow-check` before running it again.

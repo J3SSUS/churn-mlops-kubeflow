@@ -1,0 +1,24 @@
+# Temporary pod for the MLflow checks (SPEC 03). Sleeps; each mode runs with kubectl exec.
+# The code comes from the ConfigMap mlflow-check-code. Delete the pod and the ConfigMap afterwards.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mlflow-check
+  namespace: kubeflow
+spec:
+  restartPolicy: Never
+  containers:
+    - name: check
+      image: churn-base:0.1.0
+      imagePullPolicy: IfNotPresent
+      command: ["sleep", "3600"]
+      env:
+        - name: MLFLOW_TRACKING_URI
+          value: http://mlflow.mlflow.svc.cluster.local:5000
+      volumeMounts:
+        - name: code
+          mountPath: /code
+  volumes:
+    - name: code
+      configMap:
+        name: mlflow-check-code
