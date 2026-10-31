@@ -55,7 +55,7 @@ Everything runs locally on minikube (Apple Silicon Mac, Docker Desktop), on top 
 | Kubeflow Pipelines 2.15.0 | `kubeflow` | Orchestrates both pipelines (API, Argo, UI, SeaweedFS, MySQL) | installed |
 | KServe 0.21.0 + cert-manager | `kserve` (controller only) | Serving control plane, Standard mode | installed |
 | PVC `churn-data` | `kubeflow` | Raw/processed data, `models/churn/vN/model.joblib`, `submission.csv` | to create |
-| MLflow server + PVC `mlflow-data` | `mlflow` | Experiment tracking + model registry | to install |
+| MLflow server + PVC `mlflow-data` | `mlflow` | Experiment tracking + model registry | installed |
 | InferenceService `churn` | `kubeflow` | Serves the champion from `pvc://churn-data/models/churn/vN` | to create (Pipeline 2) |
 | Load generator (Job) | `kubeflow` | Replays `test.csv`, writes `submission.csv` | to write |
 | Prometheus + Grafana | `monitoring` | Serving metrics and dashboard (Helm) | to install |
