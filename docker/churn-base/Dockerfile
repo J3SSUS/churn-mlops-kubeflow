@@ -12,6 +12,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# --no-deps: requirements.txt is a complete, pinned export. Without it pip would also install
+# nvidia-nccl-cu12 (352 MB of GPU code), which xgboost declares and which was left out on purpose.
+RUN pip install --no-cache-dir --no-deps -r requirements.txt
 
 ENV PYTHONUNBUFFERED=1
