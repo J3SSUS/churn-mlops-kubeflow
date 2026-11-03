@@ -1,0 +1,53 @@
+{
+  "n_trials": 30,
+  "cv_folds": 5,
+  "families": {
+    "logreg": {
+      "class": "sklearn.linear_model.LogisticRegression",
+      "fixed": {"max_iter": 1000},
+      "search": {"C": {"type": "float", "low": 0.001, "high": 100, "log": true}}
+    },
+    "random_forest": {
+      "class": "sklearn.ensemble.RandomForestClassifier",
+      "fixed": {"n_jobs": 1},
+      "search": {
+        "n_estimators": {"type": "int", "low": 100, "high": 400},
+        "max_depth": {"type": "int", "low": 3, "high": 20},
+        "min_samples_leaf": {"type": "int", "low": 1, "high": 20},
+        "max_features": {"type": "categorical", "choices": ["sqrt", "log2"]}
+      }
+    },
+    "hist_gradient_boosting": {
+      "class": "sklearn.ensemble.HistGradientBoostingClassifier",
+      "fixed": {},
+      "search": {
+        "learning_rate": {"type": "float", "low": 0.01, "high": 0.3, "log": true},
+        "max_iter": {"type": "int", "low": 100, "high": 400},
+        "max_leaf_nodes": {"type": "int", "low": 8, "high": 64},
+        "l2_regularization": {"type": "float", "low": 0.001, "high": 10, "log": true}
+      }
+    },
+    "xgboost": {
+      "class": "xgboost.XGBClassifier",
+      "fixed": {"n_jobs": 1, "tree_method": "hist", "eval_metric": "logloss"},
+      "search": {
+        "n_estimators": {"type": "int", "low": 100, "high": 400},
+        "max_depth": {"type": "int", "low": 3, "high": 10},
+        "learning_rate": {"type": "float", "low": 0.01, "high": 0.3, "log": true},
+        "subsample": {"type": "float", "low": 0.6, "high": 1.0},
+        "colsample_bytree": {"type": "float", "low": 0.6, "high": 1.0}
+      }
+    },
+    "lightgbm": {
+      "class": "lightgbm.LGBMClassifier",
+      "fixed": {"n_jobs": 1, "verbose": -1, "subsample_freq": 1},
+      "search": {
+        "n_estimators": {"type": "int", "low": 100, "high": 400},
+        "num_leaves": {"type": "int", "low": 8, "high": 64},
+        "learning_rate": {"type": "float", "low": 0.01, "high": 0.3, "log": true},
+        "min_child_samples": {"type": "int", "low": 5, "high": 50},
+        "subsample": {"type": "float", "low": 0.6, "high": 1.0}
+      }
+    }
+  }
+}
