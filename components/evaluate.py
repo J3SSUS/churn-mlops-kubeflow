@@ -46,16 +46,20 @@ def evaluate(tune_results: List[str], kfp_run_id: str, train_path: str, holdout_
     mlflow.set_tracking_uri(config.MLFLOW_TRACKING_URI)
     models.use_experiment(config.MLFLOW_EXPERIMENT)
 
-    winner, scores = None, {}
-    for name, fam in cfg["families"].items():  # config order, so a tie goes to the first family
+    winner = None  # best CV AUC; config order, so a tie goes to the first family
+    for name in cfg["families"]:
+        if winner is None or results[name]["best_cv_auc"] > results[winner]["best_cv_auc"]:
+            winner = name
+
+    scores = {}
+    for name, fam in cfg["families"].items():
         res = results[name]
         model = models.build_pipeline(fam, res["best_params"])
         model.fit(X_train, y_train)  # all of train.csv, preprocessor fitted on it; the CV fold models are not used
         scores[name] = score(model)
         with mlflow.start_run(run_id=res["run_id"]):  # reopen the parent run that Tune closed
             mlflow.log_metrics(scores[name])
-        if winner is None or res["best_cv_auc"] > results[winner]["best_cv_auc"]:
-            winner = name
+            mlflow.set_tag("winner", "true" if name == winner else "false")
 
     dummy = DummyClassifier(strategy="prior").fit(X_train, y_train)
     with mlflow.start_run(run_name="dummy", tags={"kfp_run_id": kfp_run_id, "kind": "dummy"}):

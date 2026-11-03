@@ -59,13 +59,13 @@ Everything runs locally on minikube (Apple Silicon Mac, Docker Desktop), on top 
 | InferenceService `churn` | `kubeflow` | Serves the champion from `pvc://churn-data/models/churn/vN` | to create (Pipeline 2) |
 | Load generator (Job) | `kubeflow` | Replays `test.csv`, writes `submission.csv` | to write |
 | Prometheus + Grafana | `monitoring` | Serving metrics and dashboard (Helm) | to install |
-| Image `churn-base` | — | Python + pinned scikit-learn, mlflow, optuna, pandas, joblib, kfp | installed (`0.2.0`) |
+| Image `churn-base` | — | Python + pinned scikit-learn, mlflow, optuna, pandas, joblib, kfp, xgboost, lightgbm | installed (`0.3.0`) |
 
 **Namespace rule:** a pod can only mount a PVC from its own namespace. Pipeline pods, the InferenceService and the load generator all mount `churn-data`, so they all live in `kubeflow`. MLflow keeps its own PVC in `mlflow` and is reached over HTTP (`http://mlflow.mlflow.svc.cluster.local:5000`).
 
 ### Flow
 1. **You** copy the CSVs to `churn-data` (helper pod + `kubectl cp`) and submit Pipeline 1 with the `kfp` SDK.
-2. **Pipeline 1** reads data from the PVC. Each tuning pod runs an Optuna study for one model family; every trial is a nested run in **MLflow** under the family's parent run, which also logs the best params, CV metrics and model. Evaluate compares the best model with a `DummyClassifier` baseline on the hold-out. If it passes the gate, the best config is refit on train + hold-out and registered with alias `@champion`.
+2. **Pipeline 1** reads data from the PVC. Each tuning pod runs an Optuna study for one model family; every trial is a nested run in **MLflow** under the family's parent run, which also logs the best params and the CV metrics (no model: only Register logs one). Evaluate refits each family's best config on train, scores the hold-out next to a `DummyClassifier` baseline, logs the hold-out metrics in each family's parent run and tags the winner (best CV AUC) with `winner=true`. If it passes the gate, the best config is refit on train + hold-out and registered with alias `@champion`.
 3. **Pipeline 2** (manual run) loads `models:/churn@champion`, saves it as `model.joblib` on the PVC, creates/updates the **InferenceService**, and smoke-tests that `:predict` returns probabilities.
 4. The **load generator** sends `test.csv` rows to the endpoint and writes `submission.csv`; **Prometheus** scrapes the serving metrics and **Grafana** shows them.
 
@@ -93,9 +93,9 @@ Pipeline([
 
 | Decision | Choice | Why |
 |---|---|---|
-| Models | LogisticRegression, RandomForest, HistGradientBoosting | Three families, all scikit-learn, fast on 15k rows |
+| Models | Five families by default (LogisticRegression, RandomForest, HistGradientBoosting, XGBoost, LightGBM), defined in `components/tuning_config.json` | Scikit-learn, XGBoost and LightGBM classes with `predict_proba`, fast on 15k rows. A family or a hyperparameter is added by editing the JSON, with no change to Python |
 | Baseline | `DummyClassifier(strategy="prior")` (AUC 0.5) | Minimum reference for the gate |
-| Tuning | `ParallelFor` over model families (parallelism 2); inside each pod an **Optuna** study (TPE sampler, ~30 trials, fixed seed) maximizing mean ROC-AUC of stratified 5-fold CV, with `MedianPruner` reporting after each fold | Shows the KFP fan-out pattern; Bayesian search finds better params than random search in fewer trials; no Katib install; parallelism 2 limits SQLite contention and memory |
+| Tuning | `ParallelFor` over model families (parallelism 2); inside each pod an **Optuna** study (TPE sampler, 30 trials by default set in `components/tuning_config.json`, fixed seed) maximizing mean ROC-AUC of stratified 5-fold CV, with `MedianPruner` reporting after each fold | Shows the KFP fan-out pattern; Bayesian search finds better params than random search in fewer trials; no Katib install; parallelism 2 limits SQLite contention and memory; one thread per pod (`n_jobs: 1` and `OMP_NUM_THREADS=1`), because the minikube node has a 4-core quota |
 | Optuna storage | In-memory study per pod; results persisted in MLflow (one nested run per trial) | One study per family, nothing shared between pods, so no extra database |
 | Preprocessing | `ColumnTransformer` that selects columns **by position** (fixed feature order), inside the same sklearn `Pipeline` as the model | KServe v1 sends a numpy array without column names; serving receives raw features, no train/serve skew |
 | Split | Stratified 80/20 train/hold-out with a fixed seed | Same hold-out across runs, so champions are comparable |
@@ -104,7 +104,7 @@ Pipeline([
 | Registry | MLflow Model Registry, model `churn`, alias `@champion` | Decouples training from deployment |
 | Model handoff | Registry → `joblib` on PVC → KServe `storageUri: pvc://churn-data/…` | Same pattern that worked in Ch08; avoids S3 credentials |
 | Probabilities | `PREDICT_PROBA=true` env var on the sklearn predictor | `:predict` returns labels by default; submission needs probabilities (to verify in Phase 0) |
-| Images | One custom image `churn-base` (scikit-learn, mlflow, optuna, pandas, joblib), built with `minikube image build` | No `pip install` at every step; pins the sklearn version |
+| Images | One custom image `churn-base` (scikit-learn, mlflow, optuna, pandas, joblib, kfp, xgboost, lightgbm), built with `minikube image build` | No `pip install` at every step; pins the sklearn version |
 | Monitoring install | Helm (`kube-prometheus-stack`), install Helm with `brew install helm` | Standard way; Helm is not installed yet |
 | Cluster memory | Keep minikube at 6 GB for now | 15k rows is light; revisit if the monitoring stack gets tight |
 
@@ -133,6 +133,7 @@ Total ≈ 9–10 h. No scope cuts; the deadline moves instead.
 
 - **Probabilities from KServe:** verified in the Phase 0 spike (SPEC 02). With `PREDICT_PROBA=true`, `kserve-sklearnserver` v0.21 returns `{"predictions": [[p0, p1], ...]}`; the churn probability is the second column. No custom predictor is needed.
 - **Raw input at serving:** verified in the Phase 0 spike (SPEC 02). Rows with strings and numbers in `FEATURES` order are scored correctly by a sklearn `Pipeline` with a position-based `ColumnTransformer`, and the answer matches the local `predict_proba` (maximum difference 0). No `FunctionTransformer` is needed.
+- **XGBoost and LightGBM champions cannot be served yet:** the KServe `sklearnserver:v0.21.0` image has neither library, so a registered `Pipeline` with one of them fails to load (`ModuleNotFoundError`). The spec of Pipeline 2 must build a derived image with the same versions as `churn-base` (`xgboost 3.2.0`, `lightgbm 4.7.0`).
 - **scikit-learn version pinning:** read the version from the KServe 0.21 sklearnserver image before building `churn-base`.
 - **SQLite under parallel writes:** possible `database is locked` with concurrent tuning runs (Optuna adds one MLflow run per trial, ~90 runs per pipeline run). Mitigation: parallelism 2 and client retries; fallback Postgres.
 - **Metrics from KServe sklearn server:** unverified that v0.21 exposes Prometheus metrics in Standard mode. First check in Phase 3; fallback is the custom predictor exporting request count and latency.
@@ -152,7 +153,7 @@ portafolio/kubeflow/
 ├── docker/churn-base/         # Dockerfile + requirements.txt (pinned)
 ├── k8s/                       # PVC, MLflow, InferenceService, load-generator Job, Helm values
 ├── notebooks/eda.ipynb        # exploratory analysis, committed with aggregated outputs only
-├── components/                # KFP components: ingest, preprocess, tune, evaluate, register, fetch, publish, smoke_test
+├── components/                # KFP components: ingest, preprocess, load_config, tune, evaluate, register, fetch, publish, smoke_test; shared code in config.py, preprocessing.py, models.py and tuning_config.json
 ├── pipelines/
 │   ├── training_pipeline.py   # Pipeline 1
 │   └── deploy_pipeline.py     # Pipeline 2

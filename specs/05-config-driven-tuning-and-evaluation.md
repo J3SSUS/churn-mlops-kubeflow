@@ -34,7 +34,7 @@ SPEC 06 follows with the Gate, Register, the alias `champion` and the second run
   - MLflow: a parent run per family and a nested run per trial, with params and the CV metrics. The effective `tuning_config.json` is logged as an artifact of the parent run. Every run carries a tag with the KFP run id.
   - It returns the family, the best params, the best CV AUC and the parent `run_id`.
 - **E2.5 Evaluate component:** receives the results of all the families. For each one it refits the best config on all of `train.csv`, with the preprocessor fitted on it, and never uses the CV fold models. It then scores `holdout.csv`: ROC-AUC, PR-AUC, recall, F1 and the confusion matrix. It does the same with `DummyClassifier(strategy="prior")`.
-  - MLflow: the hold-out metrics go to the parent run of each family (`holdout_roc_auc`, `holdout_pr_auc`, `holdout_recall`, `holdout_f1` and the matrix), and the Dummy gets its own run `dummy`.
+  - MLflow: the hold-out metrics go to the parent run of each family (`holdout_roc_auc`, `holdout_pr_auc`, `holdout_recall`, `holdout_f1` and the matrix), and the Dummy gets its own run `dummy`. Each parent run also gets the tag `winner`, `true` on the winner and `false` on the others, so the winner can be found in MLflow without reading the KFP outputs.
   - It returns the winner: the family with the best CV AUC, its params, its CV AUC, its hold-out AUC and its parent `run_id`.
 - **E2.8 second part:** `pipelines/training_pipeline.py` grows to Ingest → Preprocess → Load config → `ParallelFor` over the families (`parallelism=2`) running Tune → Evaluate with the collected results. `tools/sync_code.sh` adds `models.py` and `tuning_config.json` to the ConfigMap `churn-code`.
 - **Run and check:** a first run with `n_trials: 3` to check MLflow from the pods, `ParallelFor` and SQLite, and then a full run with the defaults. MLflow shows five parent runs with nested trials, the hold-out metrics and the `dummy` run.
@@ -153,7 +153,7 @@ ingest → preprocess → load_config → ParallelFor(family, parallelism=2): tu
 
 | Run | Name | Tags | Params and metrics |
 |---|---|---|---|
-| Parent, one per family | `<family>` | `kfp_run_id`, `family`, `kind=family` | params `class`, `n_trials`, `cv_folds`, `best.<param>`; metrics `best_cv_roc_auc`, `n_complete`, `n_pruned`; artifact `tuning_config.json`; later, from Evaluate: `holdout_roc_auc`, `holdout_pr_auc`, `holdout_recall`, `holdout_f1`, `holdout_tn`, `holdout_fp`, `holdout_fn`, `holdout_tp` |
+| Parent, one per family | `<family>` | `kfp_run_id`, `family`, `kind=family`, and from Evaluate `winner=true` or `winner=false` | params `class`, `n_trials`, `cv_folds`, `best.<param>`; metrics `best_cv_roc_auc`, `n_complete`, `n_pruned`; artifact `tuning_config.json`; later, from Evaluate: `holdout_roc_auc`, `holdout_pr_auc`, `holdout_recall`, `holdout_f1`, `holdout_tn`, `holdout_fp`, `holdout_fn`, `holdout_tp` |
 | Nested, one per trial | `<family>-trial-<n>` | `kfp_run_id`, `family`, `kind=trial`, `trial_state=COMPLETE` or `PRUNED` | the suggested params; metrics `cv_roc_auc` (mean of the folds seen), `cv_roc_auc_std`, `folds_done` |
 | Baseline | `dummy` | `kfp_run_id`, `kind=dummy` | the same `holdout_*` metrics |
 
@@ -194,7 +194,7 @@ ingest → preprocess → load_config → ParallelFor(family, parallelism=2): tu
    - Check, locally against a temporary MLflow file store (`MLFLOW_TRACKING_URI` pointed at it), with `n_trials` 3 and `cv_folds` 3 for `logreg` and one boosting family: `result_json` parses and holds the four fields. The store has one parent run per family with `kind=family`, the artifact `tuning_config.json`, and three nested runs with `kind=trial`. `best_cv_auc` for `logreg` is at least 0.87. With 12 trials of `logreg`, `n_complete + n_pruned` equals 12.
 7. **Evaluate component (E2.5).**
    - Write `components/evaluate.py`.
-   - Check, locally with the file store of step 6 and a split made by `preprocess` in a temporary folder: it reopens each parent run and logs the eight `holdout_*` metrics, and it creates the `dummy` run with `holdout_roc_auc` of 0.5. `holdout_tn + holdout_fp + holdout_fn + holdout_tp` equals 3,000. The winner is the family with the highest `best_cv_auc`. No run has a model artifact.
+   - Check, locally with the file store of step 6 and a split made by `preprocess` in a temporary folder: it reopens each parent run and logs the eight `holdout_*` metrics, and it creates the `dummy` run with `holdout_roc_auc` of 0.5. `holdout_tn + holdout_fp + holdout_fn + holdout_tp` equals 3,000. The winner is the family with the highest `best_cv_auc`, its parent run has the tag `winner=true` and the other parents `winner=false`. No run has a model artifact.
 8. **Pipeline wiring (E2.8, second part).**
    - Extend `pipelines/training_pipeline.py` as in the data model, with `ParallelFor(parallelism=2)` and `dsl.Collected`. Move `ingest` and `preprocess` to `churn-base:0.3.0`, set the resources and the `MLFLOW_HTTP_REQUEST_MAX_RETRIES` variable, and add `models.py` and `tuning_config.json` to `tools/sync_code.sh`.
    - Check: the pipeline compiles. The YAML references `churn-base:0.3.0` and not `0.2.0`, has a `ParallelFor` with `parallelism: 2`, and the sync script creates a ConfigMap with four keys. If `dsl.Collected` cannot carry the results as described, stop and bring the options to the user.
@@ -202,7 +202,8 @@ ingest → preprocess → load_config → ParallelFor(family, parallelism=2): tu
    - Set `n_trials` to 3 in `tuning_config.json`, open `kubectl port-forward -n kubeflow svc/ml-pipeline 8888:8888` and `kubectl port-forward -n mlflow svc/mlflow 5001:5000`, and run `tools/submit_pipeline.py --wait`.
    - Check: the run is `Succeeded`. MLflow shows five parent runs with three nested runs each, the `holdout_*` metrics in each parent and the `dummy` run. The logs show no `database is locked`. Note the time of the run.
    - If a step fails on MLflow, memory or the image, save the pod logs and events as evidence and stop. Put `n_trials` back to 30 before the next step.
-10. **Full run, with the defaults.**
+10. **Full run, with the defaults (deferred to the end of the project).**
+    - The user will make this run at the end of the whole project, as one longer run on purpose. Until then, the criteria that need the full run stay unchecked, and `tuning_config.json` is committed with `n_trials` 30.
     - Run `tools/submit_pipeline.py --wait` with the 30 trials of the file.
     - Check: the run is `Succeeded`. Each family has 30 nested runs and `n_complete + n_pruned` equals 30. Every family has `holdout_roc_auc` above the `dummy` run. The winner is the family with the highest `best_cv_auc`. Note the time of the run and any pod restart.
 11. **Docs.**
@@ -231,6 +232,7 @@ ingest → preprocess → load_config → ParallelFor(family, parallelism=2): tu
 - [ ] `grep -c holdout components/tune.py` prints 0: Tune never reads the hold-out.
 - [ ] `evaluate` logs the eight `holdout_*` metrics in each parent run and creates the `dummy` run with `holdout_roc_auc` of 0.5.
 - [ ] `holdout_tn + holdout_fp + holdout_fn + holdout_tp` equals 3,000, and the winner is the family with the highest `best_cv_auc`.
+- [ ] `evaluate` sets `winner=true` on the parent run of the winner and `winner=false` on the other parents, and the `dummy` run has no `winner` tag.
 
 ### Pipeline on the cluster
 - [ ] `kubectl get cm churn-code -n kubeflow` holds the four keys `config.py`, `preprocessing.py`, `models.py` and `tuning_config.json`.
@@ -239,6 +241,7 @@ ingest → preprocess → load_config → ParallelFor(family, parallelism=2): tu
 - [ ] The full run finishes `Succeeded`, and for that run (filtering by `kfp_run_id`) each family has 30 nested runs with `n_complete + n_pruned` equal to 30.
 - [ ] In the full run, every family has `holdout_roc_auc` above the `dummy` run, and the winner's `holdout_roc_auc` is at least 0.85 (the CV baseline of LogReg is 0.8789).
 - [ ] Every run of the full run has the tag `kfp_run_id`.
+- [ ] In the full run, exactly one parent run has `winner=true`, and it is the family with the highest `best_cv_roc_auc`.
 - [ ] No model was registered or logged: the registry is empty and no run has a model artifact.
 - [ ] `kubectl get pods -A --no-headers | awk '$4!="Running" && $4!="Completed"'` prints nothing, and no temporary pod is left in `kubeflow`.
 
@@ -288,6 +291,9 @@ ingest → preprocess → load_config → ParallelFor(family, parallelism=2): tu
 - **No:** leaving XGBoost and LightGBM for later. The user asked for them now.
 - **No:** Katib or an Optuna database (RDB). Each study lives in its pod, and the results live in MLflow, as the README says.
 - **No:** a change to the frozen contracts. The tag and the pins go in the `DECISIONS.md` log (step 1).
+- **Yes:** Evaluate tags every parent run with `winner=true` or `winner=false`. The winner was only in the KFP outputs and in the log of the step, so in MLflow it had to be deduced by sorting. The tag lets the UI and SPEC 06 find it with `tags.winner = "true"`.
+- **Yes:** the full 30-trial run (step 10) is deferred to the end of the project, as the user decided. The 3-trial run of step 9 already proves the flow on the cluster, and one long run at the end costs less than one now plus another later.
+- **Yes:** `tuning_config.json` goes back to `n_trials` 30 after step 9, so the file that is committed is the real default and the long run needs no edit.
 
 ## Risks
 
