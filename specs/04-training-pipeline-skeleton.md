@@ -1,6 +1,6 @@
 # SPEC 04 — Training pipeline skeleton (config, ingest, preprocess)
 
-> **Status:** Approved
+> **Status:** Implemented.
 > **Depends on:** SPEC 01, SPEC 02, SPEC 03
 > **Backlog:** E2 (Pipeline 1 — Training), tasks E2.1–E2.3 of `BACKLOG.md`, plus the first part of E2.8 (wiring with two steps) and the `churn-base:0.2.0` image
 > **Date:** 2026-10-31
