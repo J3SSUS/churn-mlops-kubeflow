@@ -44,7 +44,7 @@ def evaluate(tune_results: List[str], kfp_run_id: str, train_path: str, holdout_
                 "holdout_tn": int(tn), "holdout_fp": int(fp), "holdout_fn": int(fn), "holdout_tp": int(tp)}
 
     mlflow.set_tracking_uri(config.MLFLOW_TRACKING_URI)
-    mlflow.set_experiment(config.MLFLOW_EXPERIMENT)
+    models.use_experiment(config.MLFLOW_EXPERIMENT)
 
     winner, scores = None, {}
     for name, fam in cfg["families"].items():  # config order, so a tie goes to the first family

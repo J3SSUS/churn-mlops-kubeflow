@@ -3,6 +3,7 @@ and its validation. Imported inside the component bodies, from /code in the pods
 import importlib
 import inspect
 import json
+import time
 
 from sklearn.pipeline import Pipeline
 
@@ -142,3 +143,23 @@ def build_pipeline(family_cfg, params):
     if "random_state" not in kwargs and "random_state" in _param_names(cls, class_path):
         kwargs["random_state"] = config.SEED
     return Pipeline([("prep", build_preprocessor()), ("clf", cls(**kwargs))])
+
+
+def use_experiment(name):
+    """Make `name` the active MLflow experiment and return its id. mlflow.set_experiment
+    does not set the active experiment when two processes create the same name at the same
+    moment (the loser silently logs to Default), so the id is set explicitly afterwards."""
+    import mlflow
+
+    for attempt in range(5):
+        try:
+            mlflow.set_experiment(name)
+            experiment = mlflow.get_experiment_by_name(name)
+            if experiment is not None:
+                mlflow.set_experiment(experiment_id=experiment.experiment_id)
+                return experiment.experiment_id
+        except mlflow.exceptions.MlflowException:
+            if attempt == 4:
+                raise
+        time.sleep(1)
+    raise RuntimeError(f"MLflow experiment '{name}' could not be created or found")

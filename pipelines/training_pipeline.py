@@ -26,6 +26,7 @@ def _configure(task, cpu="100m", memory="256Mi", memory_limit="1Gi"):
     task.set_cpu_request(cpu).set_memory_request(memory).set_memory_limit(memory_limit)
     task.set_env_variable("PYTHONPATH", CODE_MOUNT)
     task.set_env_variable("MLFLOW_HTTP_REQUEST_MAX_RETRIES", "10")
+    task.set_env_variable("OMP_NUM_THREADS", "1")  # one thread per pod; HGB has no n_jobs
     kubernetes.set_image_pull_policy(task, "IfNotPresent")
     kubernetes.mount_pvc(task, pvc_name=PVC_NAME, mount_path=PVC_MOUNT)
     kubernetes.use_config_map_as_volume(task, config_map_name=CODE_CONFIGMAP, mount_path=CODE_MOUNT)

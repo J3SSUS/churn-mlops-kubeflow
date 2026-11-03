@@ -9,7 +9,6 @@ def tune(family: str, kfp_run_id: str, train_path: str) -> str:
     # Imports go inside the body: KFP serializes only this function, and `config` and
     # `models` come from the ConfigMap mounted at /code (PYTHONPATH=/code).
     import json
-    import time
 
     import mlflow
     import numpy as np
@@ -33,14 +32,7 @@ def tune(family: str, kfp_run_id: str, train_path: str) -> str:
     splits = list(StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=config.SEED).split(X, y))
 
     mlflow.set_tracking_uri(config.MLFLOW_TRACKING_URI)
-    for attempt in range(3):  # two pods may create the experiment at the same moment
-        try:
-            mlflow.set_experiment(config.MLFLOW_EXPERIMENT)
-            break
-        except mlflow.exceptions.MlflowException:
-            if attempt == 2:
-                raise
-            time.sleep(2)
+    models.use_experiment(config.MLFLOW_EXPERIMENT)  # two pods may create it at the same moment
 
     tags = {"kfp_run_id": kfp_run_id, "family": family}
 
