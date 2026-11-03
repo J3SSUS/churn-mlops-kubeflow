@@ -1,6 +1,6 @@
 # SPEC 05 — Config-driven tuning and evaluation (Tune per family, Evaluate)
 
-> **Status:** Approved
+> **Status:** Implemented
 > **Depends on:** SPEC 01, SPEC 02, SPEC 03, SPEC 04
 > **Backlog:** E2 (Pipeline 1 — Training), tasks E2.4 and E2.5 of `BACKLOG.md`, plus the second part of E2.8 (`ParallelFor` wiring) and the `churn-base:0.3.0` image
 > **Date:** 2026-11-02
