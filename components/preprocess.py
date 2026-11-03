@@ -5,7 +5,7 @@ from typing import NamedTuple
 from kfp import dsl
 
 
-@dsl.component(base_image="churn-base:0.2.0")
+@dsl.component(base_image="churn-base:0.3.0")
 def preprocess(raw_path: str) -> NamedTuple(
     "Outputs", [("train_path", str), ("holdout_path", str), ("n_train", int), ("n_holdout", int)]
 ):
