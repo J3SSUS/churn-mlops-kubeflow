@@ -121,7 +121,7 @@ It returns the transformer **unfitted**. It is the same transformer as the throw
 1. **Decision lines and dependencies (image prerequisites).**
    - Add two lines to the `DECISIONS.md` log: `kfp` pinned to `2.15.0` (same as the KFP backend), and the image tag `churn-base:0.2.0` (`0.1.0` plus `kfp`).
    - In `pyproject.toml`, add `kfp==2.15.0` to the runtime dependencies and `kfp-kubernetes` to the `dev` group (pin the version that matches `kfp 2.15.0`). Run `uv lock` and regenerate `docker/churn-base/requirements.txt` with the `uv export` command in its header.
-   - Check: `git diff docker/churn-base/requirements.txt` adds only `kfp` and its dependencies (and moves `protobuf` from 7.36.2 to 6.33.6), `scikit-learn` is still `1.5.2`, and `uv run python -c "import kfp, kfp_kubernetes"` exits 0.
+   - Check: `git diff docker/churn-base/requirements.txt` adds only `kfp` and its dependencies (and moves `protobuf` from 7.36.2 to 6.33.6), `scikit-learn` is still `1.5.2`, and `uv run python -c "import kfp; from kfp import kubernetes"` exits 0.
 2. **Build the image `churn-base:0.2.0` (user runs it).**
    - The user runs `minikube image build` with the new tag, with the same command as in the runbook.
    - Check: `minikube image ls | grep churn-base` shows `0.1.0` and `0.2.0`, and a temporary pod with `0.2.0` prints the versions of `kfp` (2.15.0), `scikit-learn` (1.5.2) and `mlflow` (3.17.2). Delete the pod afterwards.
@@ -151,7 +151,7 @@ It returns the transformer **unfitted**. It is the same transformer as the throw
 ## Acceptance criteria
 
 ### Image and dependencies
-- [ ] `pyproject.toml` has `kfp==2.15.0` in the runtime dependencies and `kfp-kubernetes` in the `dev` group, and `uv run python -c "import kfp, kfp_kubernetes"` exits 0.
+- [ ] `pyproject.toml` has `kfp==2.15.0` in the runtime dependencies and `kfp-kubernetes` in the `dev` group, and `uv run python -c "import kfp; from kfp import kubernetes"` exits 0.
 - [ ] `git diff main -- docker/churn-base/requirements.txt` adds `kfp` and its dependencies, and `scikit-learn` is still `1.5.2`.
 - [ ] `minikube image ls | grep churn-base` lists `churn-base:0.1.0` and `churn-base:0.2.0`.
 - [ ] A pod with `churn-base:0.2.0` prints `kfp 2.15.0`, `scikit-learn 1.5.2` and `mlflow 3.17.2`.
@@ -213,7 +213,7 @@ It returns the transformer **unfitted**. It is the same transformer as the throw
 | Risk | Mitigation |
 |---|---|
 | Adding `kfp` moves `protobuf` from 7.36.2 to 6.33.6 in the image. `mlflow-skinny` or another package might misbehave with the older version. | Step 2 prints the versions and imports `mlflow` in a pod with `0.2.0`. If something breaks, pin `protobuf` and log it in `DECISIONS.md` before rebuilding. |
-| The `kfp-kubernetes` version may not match `kfp 2.15.0` (compile errors or missing functions such as `mount_pvc` and the ConfigMap volume). | Step 1 pins the version that `uv` resolves together with `kfp==2.15.0`, and `import kfp_kubernetes` is checked there. |
+| The `kfp-kubernetes` version may not match `kfp 2.15.0` (compile errors or missing functions such as `mount_pvc` and the ConfigMap volume). | Step 1 pins the version that `uv` resolves together with `kfp==2.15.0`, and `from kfp import kubernetes` is checked there (the package `kfp-kubernetes` is imported as `kfp.kubernetes`). |
 | KFP serializes only the component function. A module-level `import config` works at compile time on the laptop and fails in the pod with `ModuleNotFoundError`. | Imports of `config` and `preprocessing` go inside the function body (see Data model). Step 8 shows the error in the step log if it slips through. |
 | KFP caching reuses the output of a step when its spec has not changed, even if the code in the ConfigMap did. A fixed bug could seem not to run. | The cache key does not include the ConfigMap content. Every task sets `set_caching_options(False)`, and the runbook states it. |
 | The ConfigMap `churn-code` is stale and the pod runs old code. | `tools/submit_pipeline.py` runs `tools/sync_code.sh` before submitting, so the ConfigMap is refreshed on every run. |
