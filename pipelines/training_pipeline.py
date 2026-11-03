@@ -37,6 +37,7 @@ def training_pipeline():
     ingest_task = _configure(ingest())
     preprocess_task = _configure(preprocess(raw_path=ingest_task.output))
     families = _configure(load_config())
+    families.after(preprocess_task)  # the spec runs it in sequence after Preprocess
 
     with dsl.ParallelFor(items=families.output, parallelism=2) as family:
         tune_task = _configure(
