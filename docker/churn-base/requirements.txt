@@ -97,19 +97,27 @@ kfp-server-api==2.18.0
     # via kfp
 kubernetes==30.1.0
     # via kfp
+lightgbm==4.7.0
+    # via churn-mlops
 mako==1.4.3
     # via alembic
 markupsafe==3.0.4
     # via mako
 mlflow-skinny==3.17.2
     # via churn-mlops
+narwhals==2.28.0
+    # via lightgbm
 numpy==2.4.6
     # via
+    #   lightgbm
     #   optuna
     #   pandas
     #   scikit-learn
     #   scipy
     #   skops
+    #   xgboost
+nvidia-nccl-cu12==2.32.3 ; sys_platform == 'linux'
+    # via xgboost
 oauthlib==4.0.1
     # via
     #   kubernetes
@@ -194,8 +202,10 @@ scikit-learn==1.5.2
     #   skops
 scipy==1.17.1
     # via
+    #   lightgbm
     #   scikit-learn
     #   skops
+    #   xgboost
 six==1.17.0
     # via
     #   kfp-server-api
@@ -254,5 +264,7 @@ wcwidth==0.9.4
     # via prettytable
 websocket-client==1.9.2
     # via kubernetes
+xgboost==3.2.0
+    # via churn-mlops
 zipp==4.1.2
     # via importlib-metadata
