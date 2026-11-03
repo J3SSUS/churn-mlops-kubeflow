@@ -226,3 +226,53 @@ Gotchas:
 - **Local `curl` with query strings:** quote the URL in zsh (`curl 'http://localhost:5001/api/...?name=x'`), or the `?` is taken as a glob.
 - The PVC uses minikube's hostpath provisioner, so `minikube delete` loses every run and model. E2 can recreate them.
 - Pods are immutable: after editing `mlflow_check.py`, recreate the ConfigMap and delete `mlflow-check` before running it again.
+
+## Training pipeline skeleton (SPEC 04, E2.1-E2.3 and E2.8 first part)
+
+Pipeline `churn-training` with two steps, Ingest and Preprocess. Ingest validates `/mnt/data/raw/train.csv`; Preprocess drops the identifiers, makes the stratified 80/20 split with `SEED = 42` and writes `train.csv` and `holdout.csv` to `/mnt/data/processed` on the PVC. No MLflow call yet. The shared code (`config.py`, `preprocessing.py`) travels in the ConfigMap `churn-code`, mounted at `/code` with `PYTHONPATH=/code`, so a code change does not need an image rebuild.
+
+```bash
+# 1. Dependencies and image (kfp is now a runtime dependency; kfp-kubernetes is dev only)
+uv lock
+uv export --no-dev --no-hashes --format requirements-txt > docker/churn-base/requirements.txt
+minikube image build -t churn-base:0.2.0 docker/churn-base
+minikube image ls | grep churn-base                      # 0.1.0 and 0.2.0
+kubectl run churn-base-test -n kubeflow --image=churn-base:0.2.0 --image-pull-policy=IfNotPresent \
+  --restart=Never --command -- python -c 'import kfp, sklearn, mlflow; print("kfp", kfp.__version__, "| scikit-learn", sklearn.__version__, "| mlflow", mlflow.__version__)'
+kubectl wait -n kubeflow --for=jsonpath='{.status.phase}'=Succeeded pod/churn-base-test --timeout=60s
+kubectl logs churn-base-test -n kubeflow
+kubectl delete pod churn-base-test -n kubeflow
+
+# 2. Compile only (no cluster needed), then submit
+uv run python tools/submit_pipeline.py --compile-only
+kubectl port-forward -n kubeflow svc/ml-pipeline 8888:8888      # in another terminal
+uv run python tools/submit_pipeline.py --wait                   # syncs the ConfigMap, compiles, submits
+
+# 3. Check the split on the PVC (temporary pod)
+kubectl apply -f k8s/data-loader-pod.yaml
+kubectl wait -n kubeflow --for=condition=Ready pod/data-loader --timeout=90s
+kubectl exec -n kubeflow data-loader -- sh -c 'ls -l /mnt/data/processed; wc -l /mnt/data/processed/*.csv'
+kubectl delete pod data-loader -n kubeflow
+```
+
+Observed:
+
+- The pod with `churn-base:0.2.0` printed `kfp 2.15.0 | scikit-learn 1.5.2 | mlflow 3.17.2`. The build took about a minute.
+- The change in `docker/churn-base/requirements.txt` only added `kfp` and its dependencies and moved `protobuf` from 7.36.2 to 6.33.6. `scikit-learn` stayed at `1.5.2`.
+- The compiled YAML references the image `churn-base:0.2.0`, the PVC `churn-data` at `/mnt/data` and the ConfigMap `churn-code` at `/code`, with `imagePullPolicy: IfNotPresent`.
+- The run finished `SUCCEEDED` with both steps green, about 40 seconds from submit to the end.
+- Ingest logged `ingest ok: 15000 rows, 14 columns, 0 nulls`. Preprocess logged `train 12000 rows (20.3500% positive), holdout 3000 rows (20.3667% positive)`.
+- The PVC held `processed/train.csv` with 12,001 lines and `processed/holdout.csv` with 3,001 (header included). The ConfigMap `churn-code` had the keys `config.py` and `preprocessing.py`.
+- MLflow stayed untouched: only the `Default` experiment was active and the registry was empty.
+- Locally, Ingest raised on each bad copy of `train.csv` (a missing column, a text `Age`, a numeric `Geography`, one null and `Exited = 2`), and two Preprocess runs gave byte-identical files.
+
+Gotchas:
+
+- **Import name:** the package `kfp-kubernetes` is imported as `kfp.kubernetes` (`from kfp import kubernetes`), not `kfp_kubernetes`. Pin it to the same version as `kfp` (`2.15.0`).
+- **Imports inside the function:** KFP serializes only the component function, so `import config` goes inside the body. At module level it works on the laptop and fails in the pod with `ModuleNotFoundError`.
+- **Caching:** the KFP cache key does not include the ConfigMap content, so a fixed bug in `config.py` could seem not to run. Every task sets `set_caching_options(False)`.
+- **ConfigMap freshness:** `tools/submit_pipeline.py` runs `tools/sync_code.sh` before submitting. If you submit by another route, run `tools/sync_code.sh` first or the pods keep the old code.
+- **Two port-forwards:** the API (`svc/ml-pipeline`, port 8888) is what `submit_pipeline.py` needs. The UI (`svc/ml-pipeline-ui 8080:80`) is only for the browser. They are different services.
+- **Run it from the repo root:** `pipelines/training_pipeline.py` imports `components.ingest` and `components.preprocess`, and `submit_pipeline.py` adds the repo root to `sys.path` itself.
+- **Local test of a component:** call `component.python_func(...)` with `config.RAW_DIR_PVC` or `config.PROCESSED_DIR_PVC` reassigned to a temporary folder. The compiled YAML is git-ignored (`pipelines/*.yaml`) and rebuilt on every submit.
+- The pipeline pods mount `churn-data` (`ReadWriteOnce`), so a helper pod can only mount it after the run finishes.

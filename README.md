@@ -59,7 +59,7 @@ Everything runs locally on minikube (Apple Silicon Mac, Docker Desktop), on top 
 | InferenceService `churn` | `kubeflow` | Serves the champion from `pvc://churn-data/models/churn/vN` | to create (Pipeline 2) |
 | Load generator (Job) | `kubeflow` | Replays `test.csv`, writes `submission.csv` | to write |
 | Prometheus + Grafana | `monitoring` | Serving metrics and dashboard (Helm) | to install |
-| Image `churn-base` | — | Python + pinned scikit-learn, mlflow, optuna, pandas, joblib | to build |
+| Image `churn-base` | — | Python + pinned scikit-learn, mlflow, optuna, pandas, joblib, kfp | installed (`0.2.0`) |
 
 **Namespace rule:** a pod can only mount a PVC from its own namespace. Pipeline pods, the InferenceService and the load generator all mount `churn-data`, so they all live in `kubeflow`. MLflow keeps its own PVC in `mlflow` and is reached over HTTP (`http://mlflow.mlflow.svc.cluster.local:5000`).
 
