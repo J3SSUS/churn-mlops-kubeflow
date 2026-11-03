@@ -4,7 +4,10 @@ import importlib
 import inspect
 import json
 
+from sklearn.pipeline import Pipeline
+
 import config
+from preprocessing import build_preprocessor
 
 ALLOWED_PREFIXES = ("sklearn.", "xgboost.", "lightgbm.")
 SEARCH_TYPES = ("int", "float", "categorical")
@@ -113,3 +116,29 @@ def validate_config(cfg):
             _check_family(name, block, errors)
     if errors:
         raise ValueError("invalid tuning config:\n  - " + "\n  - ".join(errors))
+
+
+def suggest_params(trial, search):
+    """Ask an Optuna trial for one value per entry of a family's `search` block."""
+    params = {}
+    for name, spec in search.items():
+        if spec["type"] == "categorical":
+            params[name] = trial.suggest_categorical(name, spec["choices"])
+        elif spec["type"] == "int":
+            params[name] = trial.suggest_int(name, spec["low"], spec["high"], log=spec.get("log", False))
+        else:
+            params[name] = trial.suggest_float(name, spec["low"], spec["high"], log=spec.get("log", False))
+    return params
+
+
+def build_pipeline(family_cfg, params):
+    """UNFITTED Pipeline: build_preprocessor() plus the family's model, made from the
+    family's `fixed` parameters and the given `params`. Sets random_state=SEED when the
+    class accepts it and the config does not."""
+    class_path = family_cfg["class"]
+    module, _, cls_name = class_path.rpartition(".")
+    cls = getattr(importlib.import_module(module), cls_name)
+    kwargs = {**family_cfg.get("fixed", {}), **params}
+    if "random_state" not in kwargs and "random_state" in _param_names(cls, class_path):
+        kwargs["random_state"] = config.SEED
+    return Pipeline([("prep", build_preprocessor()), ("clf", cls(**kwargs))])
