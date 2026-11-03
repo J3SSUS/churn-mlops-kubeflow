@@ -11,7 +11,8 @@ dependencies = [
     "optuna",
     "pandas",
     "joblib",
+    "kfp==2.15.0",
 ]
 
 [dependency-groups]
-dev = ["jupyter", "matplotlib"]
+dev = ["jupyter", "matplotlib", "kfp-kubernetes==2.15.0"]
