@@ -3,7 +3,7 @@ breaks the contract. Returns the raw file path for the next step."""
 from kfp import dsl
 
 
-@dsl.component(base_image="churn-base:0.2.0")
+@dsl.component(base_image="churn-base:0.3.0")
 def ingest() -> str:
     # Imports go inside the body: KFP serializes only this function, and `config`
     # comes from the ConfigMap mounted at /code (PYTHONPATH=/code).

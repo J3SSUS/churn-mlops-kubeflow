@@ -74,7 +74,7 @@ Gotchas:
 `docker/churn-base/requirements.txt` is generated, never edited by hand. The `Dockerfile` uses `python:3.11-slim`, installs the requirements and has no `CMD`.
 
 ```bash
-uv export --no-dev --no-hashes --format requirements-txt > docker/churn-base/requirements.txt
+uv export --no-dev --no-hashes --no-emit-package nvidia-nccl-cu12 --format requirements-txt > docker/churn-base/requirements.txt
 minikube image build -t churn-base:0.1.0 docker/churn-base      # builds inside minikube (containerd)
 minikube image ls | grep churn-base                             # docker.io/library/churn-base:0.1.0
 kubectl run churn-base-test -n kubeflow --image=churn-base:0.1.0 --image-pull-policy=IfNotPresent \
@@ -234,7 +234,7 @@ Pipeline `churn-training` with two steps, Ingest and Preprocess. Ingest validate
 ```bash
 # 1. Dependencies and image (kfp is now a runtime dependency; kfp-kubernetes is dev only)
 uv lock
-uv export --no-dev --no-hashes --format requirements-txt > docker/churn-base/requirements.txt
+uv export --no-dev --no-hashes --no-emit-package nvidia-nccl-cu12 --format requirements-txt > docker/churn-base/requirements.txt
 minikube image build -t churn-base:0.2.0 docker/churn-base
 minikube image ls | grep churn-base                      # 0.1.0 and 0.2.0
 kubectl run churn-base-test -n kubeflow --image=churn-base:0.2.0 --image-pull-policy=IfNotPresent \
@@ -276,3 +276,63 @@ Gotchas:
 - **Run it from the repo root:** `pipelines/training_pipeline.py` imports `components.ingest` and `components.preprocess`, and `submit_pipeline.py` adds the repo root to `sys.path` itself.
 - **Local test of a component:** call `component.python_func(...)` with `config.RAW_DIR_PVC` or `config.PROCESSED_DIR_PVC` reassigned to a temporary folder. The compiled YAML is git-ignored (`pipelines/*.yaml`) and rebuilt on every submit.
 - The pipeline pods mount `churn-data` (`ReadWriteOnce`), so a helper pod can only mount it after the run finishes.
+
+## Config-driven tuning and evaluation (SPEC 05, E2.4-E2.5 and E2.8 second part)
+
+Pipeline `churn-training` now runs Ingest → Preprocess → Load config → `ParallelFor` (Tune per family, `parallelism=2`) → Evaluate. The families, their ranges and the number of trials live in `components/tuning_config.json` (five families by default, 30 trials each). The pods read it from the ConfigMap `churn-code`, which now has four keys: `config.py`, `preprocessing.py`, `models.py` and `tuning_config.json`. Tune logs params and CV metrics in a parent run per family and a nested run per trial. Evaluate reopens each parent run, logs the `holdout_*` metrics and the tag `winner`, and creates the run `dummy`. The winner is the family with the best CV AUC, and no model is logged: only Register (SPEC 06) will do that.
+
+```bash
+# 1. Image 0.3.0: xgboost, lightgbm and libgomp1. requirements.txt is exported without nvidia-nccl-cu12 and installed with --no-deps
+uv lock
+uv export --no-dev --no-hashes --no-emit-package nvidia-nccl-cu12 --format requirements-txt > docker/churn-base/requirements.txt
+minikube image build -t churn-base:0.3.0 docker/churn-base
+minikube image ls | grep churn-base                      # 0.1.0, 0.2.0 and 0.3.0
+kubectl run churn-base-test -n kubeflow --image=churn-base:0.3.0 --image-pull-policy=IfNotPresent \
+  --restart=Never --command -- python -c 'import kfp, sklearn, mlflow, xgboost, lightgbm; print(kfp.__version__, sklearn.__version__, mlflow.__version__, xgboost.__version__, lightgbm.__version__)'   # the real check also fits a tiny XGBClassifier and LGBMClassifier and runs pip check
+kubectl wait -n kubeflow --for=jsonpath='{.status.phase}'=Succeeded pod/churn-base-test --timeout=90s
+kubectl logs churn-base-test -n kubeflow
+kubectl delete pod churn-base-test -n kubeflow
+
+# 2. Compile only (no cluster needed), then submit
+uv run python tools/submit_pipeline.py --compile-only
+kubectl port-forward -n kubeflow svc/ml-pipeline 8888:8888      # KFP API, in another terminal
+kubectl port-forward -n mlflow svc/mlflow 5001:5000             # MLflow UI at http://localhost:5001
+uv run python tools/submit_pipeline.py                          # syncs the ConfigMap, compiles, submits
+kubectl get workflow <name> -n kubeflow -o jsonpath='{.status.phase}'   # follow the run without the KFP API
+```
+
+To find the runs of one pipeline run in MLflow, filter the experiment `churn-training` with `tags.kind = "family" and tags.kfp_run_id = "<run id>"` and sort by `best_cv_roc_auc`. `tags.winner = "true"` finds the winner.
+
+Local checks of Tune and Evaluate (no cluster): call `component.python_func(...)` with `config.MLFLOW_TRACKING_URI` pointed at a temporary directory and `config.TUNING_CONFIG_PATH` at a copy of the JSON with fewer trials. MLflow 3.17.2 blocks the file store unless `MLFLOW_ALLOW_FILE_STORE=true` is set for that run.
+
+Observed:
+
+- The `pip install` step of the build took 87 s with `nvidia-nccl-cu12` and 59 s without it. A pod with `0.3.0` printed `kfp 2.15.0 | scikit-learn 1.5.2 | mlflow 3.17.2 | xgboost 3.2.0 | lightgbm 4.7.0`, and a tiny `XGBClassifier` and `LGBMClassifier` fitted. `pip check` reports exactly one line, `xgboost 3.2.0 requires nvidia-nccl-cu12, which is not installed`, which is the intended omission.
+- A run with `n_trials: 3` finished `Succeeded` in 4 minutes (04:08:53 to 04:12:55 UTC): 5 parent runs, 15 nested runs, the `dummy` run, no `database is locked` and no model logged.
+
+  | Family | CV AUC | Hold-out AUC |
+  |---|---|---|
+  | `hist_gradient_boosting` (winner) | 0.9326 | 0.9349 |
+  | `xgboost` | 0.9317 | 0.9318 |
+  | `lightgbm` | 0.9289 | 0.9309 |
+  | `random_forest` | 0.9266 | 0.9305 |
+  | `logreg` | 0.8771 | 0.8869 |
+  | `dummy` | — | 0.5000 |
+
+- A boosting model scores about 0.05 AUC above LogReg (0.878 in the README baseline). An independent `HistGradientBoosting` with default parameters gave 0.9315 in 5-fold CV on all 15,000 rows, so the gap is not a leak.
+- The run with 30 trials was **not made**: the user will do it at the end of the project, as one longer run. Its time is unknown. The 15 to 20 minutes written in the spec was an estimate and has not been checked.
+
+Gotchas:
+
+- **KFP pods in a new run fail to reach the metadata store.** In about 17 submissions most failed within the first two minutes, in the KFP drivers and launchers, with `GetContextByTypeAndName ... mysql_real_connect failed`, `failed to pre-publish Pod info to ML Metadata ... dial tcp <metadata-grpc-service>:8080: i/o timeout`, or, in the KFP API, `lookup mysql on 10.96.0.10:53: no such host`. The failing pods were KFP's own, before our code ran. MySQL was healthy (3 of 151 connections, no connection errors), CPU was 97 % idle and 2.7 GB of memory was free. A probe pod saw TCP timeouts to the Service IPs and DNS lookups of 7 to 20 s during its first 30 s of life and while other pods were starting. **The cause was not found.** Restarting `metadata-grpc`, `ml-pipeline` and MySQL did not fix it. After the `minikube start` of SPEC 04 and after restarting Docker Desktop the first runs went through and it degraded later, so a restart helps for a while at most. Raising the node CPU quota did not fix it either.
+- **What worked was resubmitting.** A run finished on the fourth attempt of a loop that resubmits only when the failed pods show those errors. A Python traceback in a pod is a real failure of our code and is not retried. The loop was a throw-away script, not part of the repo.
+- **While the flake lasts, the KFP API also fails.** `tools/submit_pipeline.py --wait` can die with a 500 while the run keeps going, and the KFP UI can show `RUNNING` for a run that Argo already marked as failed. Follow the workflow phase with `kubectl` instead.
+- **The node has a CPU quota of 4 cores, but the pods see 12.** `nproc` says 12 and `cpu.max` of the node container says `400000 100000`. `HistGradientBoostingClassifier` has no `n_jobs`, opened 12 OpenMP threads and one trial took 4 min 51 s. Every task now sets `OMP_NUM_THREADS=1`, which is the `n_jobs: 1` rule for the libraries without that parameter. In the first 30 minutes after a Docker restart the node was throttled in 3,858 of 18,223 periods (21 %), 867 s in total (`minikube ssh "cat /sys/fs/cgroup/cpu.stat"`). `docker update --cpus=8 minikube` raises the quota without a restart and the throttling stopped, but the failures went on, so the quota was not the cause. It was not checked whether the new quota survives a `minikube stop` and `start`.
+- **`mlflow.set_experiment` has a race in MLflow 3.17.2.** When two processes create the same experiment at the same moment, the loser returns without setting the active experiment and logs to `Default`. Evaluate then fails with `Cannot start run with ID ... because active experiment ID does not match environment run ID`. It happens in the first `ParallelFor` on a fresh server. `models.use_experiment()` sets the experiment by id afterwards: with two processes, the plain call failed in 10 of 10 races and the helper in 0 of 10.
+- **A parent run without `holdout_*` metrics means Evaluate did not run** for that pipeline run. Tune never reads the hold-out (`grep -c holdout components/tune.py` prints 0).
+- **LightGBM and XGBoost take `**kwargs`**, so `validate_config` cannot see every parameter. `verbose` of LightGBM is in `KNOWN_EXTRA_PARAMS` in `components/models.py`, and `verbose` for XGBoost is rejected on purpose. With its default `subsample_freq` of 0, LightGBM ignores `subsample`, so the config fixes it to 1.
+- **`nvidia-nccl-cu12` is left out on purpose.** XGBoost 3.2.0 declares it for Linux, and its `aarch64` wheel is 352 MB of GPU code. Removing the line from `requirements.txt` was not enough, because `pip` resolved it as a dependency of `xgboost`. The `Dockerfile` installs with `pip install --no-deps`.
+- **A failed attempt leaves its Argo workflow and its pods in `Error`.** After about 17 submissions there were 16 failed workflows. The hygiene check of the spec (no pod outside `Running` or `Completed`) needs them deleted.
+- **The Docker disk was at 89 %** (50 of 59 GB): `docker system df` showed 19.5 GB of images (14.2 GB reclaimable), 26.9 GB of volumes (mostly the minikube node: 23.4 GB in `containerd`) and 7 GB of build cache. `docker image prune -a` only removes images no container uses. Do not run `docker volume prune`, because it can take data from other projects.
+- **The port-forwards die** with `minikube stop` and when the pod behind the Service is replaced, because each one is tied to one pod. The API one (8888) is the one `submit_pipeline.py` needs.
+- **BusyBox `nslookup` exits with an error** when a search domain answers `NXDOMAIN`, even if the right name resolves. Use the FQDN with a trailing dot when testing DNS with it.

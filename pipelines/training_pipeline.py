@@ -1,12 +1,16 @@
-"""Pipeline 1 — Training (KFP v2). SPEC 04: Ingest -> Preprocess only.
+"""Pipeline 1 — Training (KFP v2). SPEC 05: Ingest -> Preprocess -> Load config ->
+ParallelFor(Tune per family) -> Evaluate. Gate and Register come in SPEC 06.
 
 Run from the repo root so `components` is importable. Compile and submit with
 tools/submit_pipeline.py.
 """
 from kfp import dsl, kubernetes
 
+from components.evaluate import evaluate
 from components.ingest import ingest
+from components.load_config import load_config
 from components.preprocess import preprocess
+from components.tune import tune
 
 PVC_NAME = "churn-data"
 PVC_MOUNT = "/mnt/data"
@@ -14,19 +18,41 @@ CODE_CONFIGMAP = "churn-code"
 CODE_MOUNT = "/code"
 
 
-def _configure(task):
+def _configure(task, cpu="100m", memory="256Mi", memory_limit="1Gi"):
     """Settings shared by every step: code from the ConfigMap, data from the PVC,
-    local image, no caching (the cache key ignores the ConfigMap content)."""
+    local image, no caching (the cache key ignores the ConfigMap content), and more
+    MLflow client retries for the SQLite server."""
     task.set_caching_options(False)
-    task.set_cpu_request("100m").set_memory_request("256Mi").set_memory_limit("1Gi")
+    task.set_cpu_request(cpu).set_memory_request(memory).set_memory_limit(memory_limit)
     task.set_env_variable("PYTHONPATH", CODE_MOUNT)
+    task.set_env_variable("MLFLOW_HTTP_REQUEST_MAX_RETRIES", "10")
+    task.set_env_variable("OMP_NUM_THREADS", "1")  # one thread per pod; HGB has no n_jobs
     kubernetes.set_image_pull_policy(task, "IfNotPresent")
     kubernetes.mount_pvc(task, pvc_name=PVC_NAME, mount_path=PVC_MOUNT)
     kubernetes.use_config_map_as_volume(task, config_map_name=CODE_CONFIGMAP, mount_path=CODE_MOUNT)
     return task
 
 
-@dsl.pipeline(name="churn-training", description="Churn training: ingest and preprocess (SPEC 04)")
+@dsl.pipeline(name="churn-training", description="Churn training: ingest, preprocess, tune per family, evaluate (SPEC 05)")
 def training_pipeline():
     ingest_task = _configure(ingest())
-    _configure(preprocess(raw_path=ingest_task.output))
+    preprocess_task = _configure(preprocess(raw_path=ingest_task.output))
+    families = _configure(load_config())
+    families.after(preprocess_task)  # the spec runs it in sequence after Preprocess
+
+    with dsl.ParallelFor(items=families.output, parallelism=2) as family:
+        tune_task = _configure(
+            tune(
+                family=family,
+                kfp_run_id=dsl.PIPELINE_JOB_ID_PLACEHOLDER,
+                train_path=preprocess_task.outputs["train_path"],
+            ),
+            cpu="500m", memory="512Mi", memory_limit="1536Mi",
+        )
+
+    _configure(evaluate(
+        tune_results=dsl.Collected(tune_task.output),
+        kfp_run_id=dsl.PIPELINE_JOB_ID_PLACEHOLDER,
+        train_path=preprocess_task.outputs["train_path"],
+        holdout_path=preprocess_task.outputs["holdout_path"],
+    ))
