@@ -18,4 +18,5 @@ MLFLOW_TRACKING_URI = "http://mlflow.mlflow.svc.cluster.local:5000"
 MLFLOW_EXPERIMENT = "churn-training"
 MODEL_NAME = "churn"                          # frozen contract
 CHAMPION_ALIAS = "champion"                   # frozen contract
+GATE_MARGIN = 0.05                            # frozen contract: hold-out AUC must beat Dummy + 0.05
 TUNING_CONFIG_PATH = "/code/tuning_config.json"   # the ConfigMap mount; tests point it elsewhere
