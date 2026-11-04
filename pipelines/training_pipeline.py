@@ -1,5 +1,5 @@
 """Pipeline 1 — Training (KFP v2). SPEC 05: Ingest -> Preprocess -> Load config ->
-ParallelFor(Tune per family) -> Evaluate. Gate and Register come in SPEC 06.
+ParallelFor(Tune per family) -> Evaluate. SPEC 06: Gate -> If(passed) Register.
 
 Run from the repo root so `components` is importable. Compile and submit with
 tools/submit_pipeline.py.
@@ -7,9 +7,11 @@ tools/submit_pipeline.py.
 from kfp import dsl, kubernetes
 
 from components.evaluate import evaluate
+from components.gate import gate
 from components.ingest import ingest
 from components.load_config import load_config
 from components.preprocess import preprocess
+from components.register import register
 from components.tune import tune
 
 PVC_NAME = "churn-data"
@@ -33,7 +35,7 @@ def _configure(task, cpu="100m", memory="256Mi", memory_limit="1Gi"):
     return task
 
 
-@dsl.pipeline(name="churn-training", description="Churn training: ingest, preprocess, tune per family, evaluate (SPEC 05)")
+@dsl.pipeline(name="churn-training", description="Churn training: ingest, preprocess, tune per family, evaluate, gate, register (SPEC 06)")
 def training_pipeline():
     ingest_task = _configure(ingest())
     preprocess_task = _configure(preprocess(raw_path=ingest_task.output))
@@ -50,9 +52,32 @@ def training_pipeline():
             cpu="500m", memory="512Mi", memory_limit="1536Mi",
         )
 
-    _configure(evaluate(
+    evaluate_task = _configure(evaluate(
         tune_results=dsl.Collected(tune_task.output),
         kfp_run_id=dsl.PIPELINE_JOB_ID_PLACEHOLDER,
         train_path=preprocess_task.outputs["train_path"],
         holdout_path=preprocess_task.outputs["holdout_path"],
     ))
+
+    gate_task = _configure(gate(
+        winner_holdout_auc=evaluate_task.outputs["winner_holdout_auc"],
+        winner_family=evaluate_task.outputs["winner_family"],
+        winner_run_id=evaluate_task.outputs["winner_run_id"],
+        kfp_run_id=dsl.PIPELINE_JOB_ID_PLACEHOLDER,
+    ))
+
+    # A rejection is a normal result: the gate succeeds with passed=False and Register is skipped.
+    with dsl.If(gate_task.outputs["passed"] == True):  # noqa: E712 (KFP builds the condition from ==)
+        _configure(
+            register(
+                winner_family=evaluate_task.outputs["winner_family"],
+                winner_params=evaluate_task.outputs["winner_params"],
+                winner_cv_auc=evaluate_task.outputs["winner_cv_auc"],
+                winner_holdout_auc=evaluate_task.outputs["winner_holdout_auc"],
+                winner_run_id=evaluate_task.outputs["winner_run_id"],
+                kfp_run_id=dsl.PIPELINE_JOB_ID_PLACEHOLDER,
+                train_path=preprocess_task.outputs["train_path"],
+                holdout_path=preprocess_task.outputs["holdout_path"],
+            ),
+            cpu="500m", memory="512Mi", memory_limit="1536Mi",
+        )

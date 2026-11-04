@@ -19,7 +19,7 @@
   - A rejection is a normal result: the step succeeds with `passed=false`. The step fails only on an error: MLflow unreachable, no `dummy` run for this `kfp_run_id`, or a champion version without the tag `holdout_roc_auc`.
 - **E2.7 Register component (`components/register.py`):** refits the winner on train + hold-out and registers it.
   - Inputs: the five `winner_*` outputs of Evaluate, `kfp_run_id`, `train_path` and `holdout_path`.
-  - It builds the pipeline with `models.build_pipeline` from `winner_family` and `winner_params`, fits it on `train.csv` + `holdout.csv`, and logs it with `mlflow.sklearn.log_model` (signature and input example) in a new run `register` with the tags `kfp_run_id` and `kind=register`.
+  - It builds the pipeline with `models.build_pipeline` from `winner_family` and `winner_params`, fits it on `train.csv` + `holdout.csv`, and logs it with `mlflow.sklearn.log_model` (signature, input example and `serialization_format="cloudpickle"`) in a new run `register` with the tags `kfp_run_id` and `kind=register`.
   - It registers the model `churn`, tags the new version with `holdout_roc_auc` (the pre-refit number from Evaluate), `winner_run_id`, `family` and `kfp_run_id`, and only then sets the alias `champion` on that version.
   - It then reloads `models:/churn@champion` and checks that `predict_proba` on a few rows returns shape `(n, 2)`.
   - Outputs: `model_version` (`str`) and `model_uri` (`str`).
@@ -29,7 +29,7 @@
 - **E2.9 Run and verify:**
   - Two runs on the cluster with `n_trials: 3`: the first creates `churn` v1 with the alias `champion`, the second compares against it and, by the tie with the same seed and params, creates v2.
   - The rejection path is checked locally against a temporary MLflow store with a fake champion whose AUC is higher than the winner's.
-- **Docs:** a "Gate and Register" section in `docs/runbook.md`, the ticks in `BACKLOG.md` (E2.6 to E2.9, with E2.9 noting that the long run is deferred), and the Pipeline 1 flow in README §4 brought in line with what was built (Evaluate logs no model; Register does).
+- **Docs:** one line in the `DECISIONS.md` log (the `cloudpickle` format, already written), a "Gate and Register" section in `docs/runbook.md`, the ticks in `BACKLOG.md` (E2.6 to E2.9, with E2.9 noting that the long run is deferred), and the Pipeline 1 flow in README §4 brought in line with what was built (Evaluate logs no model; Register does).
 
 **Out of scope (for future specs):**
 
@@ -80,7 +80,7 @@ ingest → preprocess → load_config → ParallelFor(family, parallelism=2): tu
 | Object | Name | Tags | Contents |
 |---|---|---|---|
 | Tag on the parent run of the winner | — | `gate` = `passed` or `rejected` | set by Gate |
-| Run, one per Register | `register` | `kfp_run_id`, `kind=register`, `family` | the logged model (artifact path `model`, signature and input example); params `family` and `best.<param>`; metric `winner_holdout_auc` copied from Evaluate (the pre-refit number) |
+| Run, one per Register | `register` | `kfp_run_id`, `kind=register`, `family` | the logged model (an MLflow 3 logged model named `model`, linked to the run by `source_run_id`, with signature and input example, saved as `cloudpickle`); params `family` and `best.<param>`; metric `winner_holdout_auc` copied from Evaluate (the pre-refit number) |
 | Registered model | `churn` | — | one new version per Register |
 | Model version tags | — | `holdout_roc_auc`, `winner_run_id`, `family`, `kfp_run_id` | `holdout_roc_auc` is what the next Gate reads; set **before** the alias moves |
 | Alias | `champion` | — | moved to the newest version by Register, after its tags are set |
@@ -117,14 +117,15 @@ ingest → preprocess → load_config → ParallelFor(family, parallelism=2): tu
      - The first call returns version `1`, the alias `champion` points to it, and the version has the four tags.
      - The calls to `MlflowClient` happen in this order: the four `set_model_version_tag` calls, then `set_registered_model_alias`.
      - A second call returns version `2`, the alias moves to `2`, and version `1` still exists.
-     - The run `register` has `kind=register`, the artifact `model` and no `holdout_*` metric.
+     - The run `register` has `kind=register`, a logged model `model` (found by `source_run_id`) with signature and input example, and no `holdout_*` metric.
+     - Each of the five families of the default config (`logreg`, `random_forest`, `hist_gradient_boosting`, `xgboost`, `lightgbm`) registers and reloads, with `predict_proba` of shape `(n, 2)`.
      - `grep -c roc_auc_score components/register.py` prints 0.
 4. **Pipeline wiring (E2.8, last part).**
    - Extend `pipelines/training_pipeline.py` as in the data model: `gate` after `evaluate`, and `register` inside `dsl.If(gate_task.outputs["passed"] == True)`. Both go through `_configure`, with the resources of the data model.
    - Check: the pipeline compiles. The compiled YAML has a condition on the output of the gate task, has `register` inside it, and references `churn-base:0.3.0` and not `0.2.0`. `tools/sync_code.sh` still creates a ConfigMap with four keys. If `dsl.If` cannot compare the `bool` output as written, stop and bring the options to the user.
 5. **First run on the cluster, with 3 trials.**
    - Set `n_trials` to 3 in `tuning_config.json`, run `tools/sync_code.sh`, open `kubectl port-forward -n kubeflow svc/ml-pipeline 8888:8888` and `kubectl port-forward -n mlflow svc/mlflow 5001:5000`, and run `tools/submit_pipeline.py --wait`.
-   - Check: the run is `Succeeded`. The winner's parent run has `gate=passed`. MLflow shows `churn` version 1 with the alias `champion` and its four tags, and the run `register` with the model artifact. The logs show no `database is locked`. Note the time of the run and the size of the model artifact.
+   - Check: the run is `Succeeded`. The winner's parent run has `gate=passed`. MLflow shows `churn` version 1 with the alias `champion` and its four tags, and the run `register` with its logged model `model`. The logs show no `database is locked`. Note the time of the run and the size of the model artifact.
    - If a step fails on MLflow, memory or the image, save the pod logs and events as evidence and stop.
 6. **Second run on the cluster, against the existing champion.**
    - Run `tools/submit_pipeline.py --wait` again with the same 3 trials. With the same seed and params, the winner ties with version 1.
@@ -152,14 +153,15 @@ ingest → preprocess → load_config → ParallelFor(family, parallelism=2): tu
 - [ ] The alias `champion` is moved after the version has its four tags: the four `set_model_version_tag` calls come before `set_registered_model_alias`.
 - [ ] The tag `holdout_roc_auc` of the version equals the `winner_holdout_auc` that was passed in (the pre-refit number).
 - [ ] A second call returns version `2`, the alias moves to `2`, and version `1` still exists.
-- [ ] The run `register` has `kind=register`, the artifact `model` with signature and input example, and no `holdout_*` metric.
+- [ ] The run `register` has `kind=register`, a logged model `model` (found by `source_run_id`) with signature and input example, and no `holdout_*` metric.
+- [ ] Register registers and reloads each of the five families of the default config (`logreg`, `random_forest`, `hist_gradient_boosting`, `xgboost`, `lightgbm`), and the reloaded model returns `predict_proba` of shape `(n, 2)`.
 - [ ] `grep -c roc_auc_score components/register.py` prints 0: Register never scores the refit model.
 - [ ] The reloaded `models:/churn@champion` returns `predict_proba` of shape `(n, 2)` on raw rows in `FEATURES` order.
 
 ### Pipeline on the cluster
 - [ ] The compiled pipeline YAML has a condition on the output of the gate task, has `register` inside it, and references `churn-base:0.3.0` and not `0.2.0`.
 - [ ] `kubectl get cm churn-code -n kubeflow` still holds the four keys `config.py`, `preprocessing.py`, `models.py` and `tuning_config.json`.
-- [ ] The first run with 3 trials finishes `Succeeded`. For that run (filtering by `kfp_run_id`) the winner's parent run has `gate=passed`, `churn` has version 1 with the alias `champion` and its four tags, and the run `register` has the model artifact.
+- [ ] The first run with 3 trials finishes `Succeeded`. For that run (filtering by `kfp_run_id`) the winner's parent run has `gate=passed`, `churn` has version 1 with the alias `champion` and its four tags, and the run `register` has a logged model `model`.
 - [ ] The second run with 3 trials finishes `Succeeded`. The gate log names champion version 1, `churn` has version 2 with the alias `champion`, and version 1 still exists.
 - [ ] The logs of both runs show no `database is locked`.
 - [ ] Every run of both pipeline runs, including `register`, has the tag `kfp_run_id`.
@@ -169,7 +171,7 @@ ingest → preprocess → load_config → ParallelFor(family, parallelism=2): tu
 - [ ] `docs/runbook.md` has a "Gate and Register" section with the commands run, the observed results, the times of both runs and the gotchas.
 - [ ] `BACKLOG.md` has E2.6 to E2.9 ticked, and E2.9 says the long run is still deferred.
 - [ ] README §4 says that Evaluate logs no model and that Register logs and registers it.
-- [ ] `git diff main -- DECISIONS.md` shows no change to the frozen contracts table.
+- [ ] `git diff main -- DECISIONS.md` shows no change to the frozen contracts table, and the log has a dated line for the `cloudpickle` format of Register.
 - [ ] `git diff main -- components/tuning_config.json` is empty (`n_trials` is 30), and `git ls-files | grep -c '\.csv$'` returns 0.
 
 ## Decisions
@@ -191,6 +193,11 @@ ingest → preprocess → load_config → ParallelFor(family, parallelism=2): tu
 - **No:** logging the model in the winner's parent run. That run is closed by Tune and reopened by Evaluate, and it would mix the pre-refit numbers with a model fitted on other data.
 - **Yes:** Register sets the four tags of the version before it moves the alias. A failure between the calls can then never leave a champion without the tag that the next gate reads.
 - **No:** moving the alias first. A failure after it would leave `churn@champion` pointing to a version the gate cannot compare against, and every later run would fail on it.
+- **Yes:** Register logs with `serialization_format="cloudpickle"`. MLflow 3.17.2 saves sklearn models as `skops` by default, and `skops` refuses the `xgboost` and `lightgbm` types as untrusted, so a registration of those families failed in a local test. `cloudpickle` works for all five families and gives up nothing: Pipeline 2 turns the model into `model.joblib`, which is a pickle too. The reason is in the `DECISIONS.md` log (2026-11-04).
+- **No:** `skops` with a list of `skops_trusted_types`. The list depends on the family and on the library version, and each new family in the JSON could break Register.
+- **No:** `skops` with the untrusted types read from the saved file. It switches off the protection that `skops` gives, with more code.
+- **Yes:** Register logs the whole `Pipeline` with `mlflow.sklearn.log_model` for every family. `XGBClassifier` and `LGBMClassifier` are scikit-learn-API wrappers, so they fit inside it.
+- **No:** `mlflow.xgboost.log_model` or `mlflow.lightgbm.log_model`. Those flavors save the bare booster, without the preprocessor that Pipeline 2 serves on raw rows.
 - **Yes:** Register never computes a metric on the refit model. The hold-out is part of its training set, so any score would be inflated. The reported number is the pre-refit one from Evaluate, copied as a metric of the `register` run and as a tag of the version.
 - **Yes:** the signature takes the raw `FEATURES` columns as input and `predict_proba` as output, with five rows of `train.csv` as the input example. It is the same shape that Pipeline 2 serves.
 - **Yes:** Register reloads `models:/churn@champion` and checks the shape of `predict_proba`. It costs seconds and proves the registry round trip that Pipeline 2 depends on.
@@ -204,7 +211,7 @@ ingest → preprocess → load_config → ParallelFor(family, parallelism=2): tu
 - **Yes:** two cluster runs with 3 trials: the first creates version 1, and the second ties with it (same seed and params) and creates version 2. It checks both the empty-registry case and the comparison against an existing champion.
 - **Yes:** the full 30-trial run stays deferred to the end of the project, as decided in SPEC 05. `n_trials` goes back to 30 before committing.
 - **Yes:** the pipeline keeps using `_configure` for the two new tasks. The code ConfigMap, the PVC, caching off and the MLflow retries then apply to them with no special case.
-- **No:** a change to the frozen contracts. The gate rule, the registry names and the split are used as written, so `DECISIONS.md` needs no new line.
+- **No:** a change to the frozen contracts. The gate rule, the registry names and the split are used as written, so the table of `DECISIONS.md` does not change. The only new line of its log is the `cloudpickle` format.
 
 ## Risks
 
@@ -214,6 +221,7 @@ ingest → preprocess → load_config → ParallelFor(family, parallelism=2): tu
 | `dsl.If` cannot compare the `bool` output of the gate as written in KFP 2.15. | Step 4 compiles and inspects the YAML before the cluster. If it fails, stop and bring the options to the user (for example a `str` output compared with `"true"`). |
 | Register fails between its calls and leaves version N with the alias `champion` but without the tag `holdout_roc_auc`. The next gate would then fail on it by design. | Register sets the version tags **before** moving the alias, so a failure can never leave a champion without its tag. Step 3 checks the order of the calls. |
 | `log_model` fails in the pod, or the model does not reload there (missing library, or a version different from training). | The reload of `models:/churn@champion` inside Register fails the step in the same pod, with the same image that Pipeline 2 will use. Step 5 shows the traceback in the log of the step. |
+| Register fails with an XGBoost or LightGBM champion because the default `skops` format refuses their types. | Register logs with `cloudpickle` (see `DECISIONS.md`, 2026-11-04). Step 3 registers and reloads each of the five families locally. |
 | Each registered model is a full fitted `Pipeline` on the MLflow PVC (2Gi). A Random Forest of 400 trees can weigh tens of MB, and every run adds another. | Two runs in this spec. Step 5 notes the size of the artifact in the runbook. If it grows too much, raising the PVC is a decision for a later spec. |
 | The temporary SQLite store of the local checks behaves differently from the MLflow server of the cluster (same client version, different backend and artifact path). | The local checks cover the logic only. The first real contact with the server is step 5, and the two cluster runs are the integration test. |
 | KFP runs fail in their first minutes (drivers or launchers cannot reach `metadata-grpc` or MySQL). The cause was not found. After a `minikube stop` the port-forwards die and the CPU quota may be lower than 8. | Resubmit. A Python traceback in a pod is a real failure and not this flake. Before step 5, check `cpu.max` of the node and reopen the port-forwards. Delete the Error pods that failed attempts leave. The checks filter by `kfp_run_id`, so partial runs do not count. |
