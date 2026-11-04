@@ -163,3 +163,18 @@ def use_experiment(name):
                 raise
         time.sleep(1)
     raise RuntimeError(f"MLflow experiment '{name}' could not be created or found")
+
+
+def gate_decision(winner_auc, dummy_auc, champion_auc=None, champion_label="champion"):
+    """The gate rule of the frozen contracts: the winner's hold-out AUC must be strictly above
+    Dummy + GATE_MARGIN and, if there is a champion, at least equal to the champion's.
+    Returns (passed, reason); `champion_auc` is None when there is no champion."""
+    floor = dummy_auc + config.GATE_MARGIN
+    base = f"winner {winner_auc:.4f} {'>' if winner_auc > floor else '<='} dummy {dummy_auc:.4f} + {config.GATE_MARGIN:g}"
+    if winner_auc <= floor:
+        return False, base
+    if champion_auc is None:
+        return True, f"{base}; no champion yet"
+    if winner_auc >= champion_auc:
+        return True, f"{base} and >= {champion_label} {champion_auc:.4f}"
+    return False, f"{base} but < {champion_label} {champion_auc:.4f}"
