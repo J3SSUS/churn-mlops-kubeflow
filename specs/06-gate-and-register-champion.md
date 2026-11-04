@@ -1,6 +1,6 @@
 # SPEC 06 — Gate, Register and champion alias
 
-> **Status:** Approved
+> **Status:** Implemented
 > **Depends on:** SPEC 01, SPEC 02, SPEC 03, SPEC 04, SPEC 05
 > **Backlog:** E2 (Pipeline 1 — Training), tasks E2.6, E2.7 and E2.9 of `BACKLOG.md`, plus the last part of E2.8 (the `dsl.If` Gate → Register wiring)
 > **Date:** 2026-11-04
