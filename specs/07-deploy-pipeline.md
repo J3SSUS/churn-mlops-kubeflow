@@ -1,6 +1,6 @@
 # SPEC 07 — Deploy pipeline (serve the champion)
 
-> **Status:** Approved
+> **Status:** Implemented
 > **Depends on:** SPEC 01, SPEC 02, SPEC 03, SPEC 04, SPEC 05, SPEC 06
 > **Backlog:** E3 (Pipeline 2 — Deploy), tasks E3.1 to E3.5 of `BACKLOG.md`, plus the derived serving image for XGBoost and LightGBM champions that SPEC 05 and SPEC 06 left to this spec
 > **Date:** 2026-11-06
