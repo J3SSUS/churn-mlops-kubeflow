@@ -405,3 +405,43 @@ Gotchas:
 
 - `kubectl get pods` listed the old `churn-training-*` pods in the first seconds after the start and none a few minutes later, so a service account cannot be read from a past run. A direct read needs a live step pod.
 - A bare `kubectl run ... --rm` with `--image-pull-policy=Never` works for `churn-base` because `minikube image build` put it in the node. The `sklearnserver` image was already in the node from the spike, and `IfNotPresent` is enough.
+
+### Derived serving image `churn-sklearnserver:0.1.0` (step 4)
+
+`docker/churn-sklearnserver/Dockerfile` starts from `kserve/sklearnserver:v0.21.0`, installs `libgomp1` as root, installs the three packages of `requirements.txt` (`xgboost`, `lightgbm` and `narwhals`, which `lightgbm` requires) with `uv pip install --no-deps` (uv comes from `ghcr.io/astral-sh/uv:0.11.29` and is only bind-mounted for that `RUN`, so the final image has neither `uv` nor `pip`), and returns to uid 1000. The last `RUN` imports both libraries as that user, so a missing `libgomp` fails the build. The `uv` tag is the version installed on the laptop; if the registry has no such tag, the build fails at the first line and the tag is the thing to change.
+
+```bash
+minikube image build -t churn-sklearnserver:0.1.0 docker/churn-sklearnserver
+minikube image ls | grep churn-sklearn
+```
+
+The check runs `tools/serving_image_check.py` in temporary pods built from `k8s/serving-image-check-pod.yaml` (a template: `sed` fills the name, image and mode). The script and the code reach the pods through the ConfigMaps `serving-image-check` and `churn-code`.
+
+```bash
+kubectl create configmap serving-image-check -n kubeflow \
+  --from-file=serving_image_check.py=tools/serving_image_check.py --dry-run=client -o yaml | kubectl apply -f -
+tools/sync_code.sh        # refreshes churn-code (config.py now has the SPEC 07 constants)
+
+check() {   # check <pod name> <image> <fit|load|clean>
+  sed -e "s|__NAME__|$1|" -e "s|__IMAGE__|$2|" -e "s|__MODE__|$3|" k8s/serving-image-check-pod.yaml | kubectl apply -f -
+  kubectl wait -n kubeflow pod/$1 --for=jsonpath='{.status.containerStatuses[0].state.terminated}' --timeout=240s
+  kubectl logs -n kubeflow $1
+  kubectl get pod -n kubeflow $1 -o jsonpath='exit code: {.status.containerStatuses[0].state.terminated.exitCode}{"\n"}'
+  kubectl delete pod -n kubeflow $1 --wait=false
+}
+check image-check-fit  churn-base:0.3.0            fit     # writes models/image-check/ on the PVC
+check image-check-load churn-sklearnserver:0.1.0   load    # the derived image: all five families ok
+check image-check-orig kserve/sklearnserver:v0.21.0 load   # the original: xgboost and lightgbm fail
+```
+
+`models/image-check/` and the ConfigMap `serving-image-check` are temporary: they are removed at the end of step 5 (`check image-check-clean churn-base:0.3.0 clean`, then `kubectl delete configmap serving-image-check -n kubeflow`).
+
+The script was also run on the laptop, outside the cluster, in a temporary folder: `fit` saved the five files (4.9 MB in total) and `load` printed `ok max_diff=0.000e+00` for the five families. With one file replaced by garbage, `load` printed the error for that family only and exited with code 1.
+
+Observed (2026-11-06):
+
+- **The first build failed at the import check, as designed.** With only `xgboost` and `lightgbm` in `requirements.txt`, the last `RUN` of the Dockerfile failed with `ModuleNotFoundError: No module named 'narwhals'`: `lightgbm 4.7.0` requires `narwhals>=1.15` and `--no-deps` skips it. `xgboost 3.2.0` needs only `numpy` and `scipy`. Adding `narwhals==2.28.0` (the `churn-base` pin) fixed it, and the second build printed `numpy 2.4.4 | scipy 1.17.1 | scikit-learn 1.5.2 | xgboost 3.2.0 | lightgbm 4.7.0` as uid 1000. The `uv` tag `0.11.29` exists in `ghcr.io`, and `RUN --mount=type=bind,from=uv` works with the builder of `minikube image build`. The install took about 13 s (the `xgboost` wheel is 125 MiB), and the `libgomp1` layer was cached on the second build.
+- **The derived image loads the five families.** `fit` in a `churn-base:0.3.0` pod wrote the five files (exit 0). `load` in `churn-sklearnserver:0.1.0` (Python 3.11.16, numpy 2.4.4, scikit-learn 1.5.2) printed `ok max_diff=0.000e+00` for `logreg`, `random_forest`, `hist_gradient_boosting`, `xgboost` and `lightgbm`, exit 0. The models were pickled under numpy 2.4.6 and loaded under 2.4.4 with no difference at all.
+- **The original image fails exactly where expected.** `load` in `kserve/sklearnserver:v0.21.0` passed `logreg`, `random_forest` and `hist_gradient_boosting` and printed `error ModuleNotFoundError: No module named 'xgboost'` and `... 'lightgbm'`, exit 1. So the derived image is what fixes it.
+- **Package comparison.** `pip freeze` cannot run here (neither image has `pip`, by design), so the installed distributions were listed with `importlib.metadata` in both images and compared with `diff`. The original has 114 and the derived 117. The only differences are three added lines: `lightgbm==4.7.0`, `narwhals==2.28.0` and `xgboost==3.2.0`. `scikit-learn` is still `1.5.2`, `numpy` `2.4.4`, `scipy` `1.17.1`, `joblib` `1.5.3` and `pandas` `2.3.3`. Neither `pip` nor `uv` is in the derived image.
+- **Disk.** The node `/var` went from 89 % (6.3 GB free) to 91 % (5.5 GB free) after pulling `uv`, the `xgboost` wheel and the new image layers.

@@ -1,0 +1,43 @@
+# TEMPLATE for the temporary pods of the serving image check (SPEC 07, step 4).
+# Not applied as is: __NAME__, __IMAGE__ and __MODE__ are filled with sed (see docs/runbook.md).
+#   __MODE__ = fit | load | clean   (tools/serving_image_check.py)
+# The code comes from the ConfigMaps churn-code (/code) and serving-image-check (/check).
+# Delete the pod, the ConfigMap and models/image-check on the PVC afterwards.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: __NAME__
+  namespace: kubeflow
+spec:
+  restartPolicy: Never
+  containers:
+    - name: check
+      image: __IMAGE__
+      imagePullPolicy: IfNotPresent
+      command: ["python", "/check/serving_image_check.py", "__MODE__"]
+      env:
+        # Overrides the PYTHONPATH of the server image (/sklearnserver): the script needs only /code.
+        - name: PYTHONPATH
+          value: /code
+        - name: OMP_NUM_THREADS
+          value: "1"
+      resources:
+        requests: {cpu: 100m, memory: 256Mi}
+        limits: {memory: 1Gi}
+      volumeMounts:
+        - name: data
+          mountPath: /mnt/data
+        - name: code
+          mountPath: /code
+        - name: check
+          mountPath: /check
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: churn-data
+    - name: code
+      configMap:
+        name: churn-code
+    - name: check
+      configMap:
+        name: serving-image-check

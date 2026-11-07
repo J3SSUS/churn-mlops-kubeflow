@@ -1,0 +1,9 @@
+# Pinned list for the derived serving image (SPEC 07). Same versions as docker/churn-base/requirements.txt.
+# Installed with --no-deps on purpose: the base image already ships numpy, scipy and scikit-learn, and a
+# resolver run here could move them. So this list must hold every REQUIRED dependency the base lacks:
+#   xgboost 3.2.0   requires numpy, scipy (nvidia-nccl-cu12 is left out on purpose, see DECISIONS.md)
+#   lightgbm 4.7.0  requires numpy, scipy and narwhals (found by the import check at the end of the Dockerfile)
+# When a pin changes, read `importlib.metadata.requires(...)` of both libraries again.
+xgboost==3.2.0
+lightgbm==4.7.0
+narwhals==2.28.0
