@@ -1,0 +1,33 @@
+# RBAC for the deploy pipeline (SPEC 07, E3.1). The step pods run as the service account
+# `pipeline-runner`, which already has a Role of the same name (pods, PVCs, Argo, kubeflow.org)
+# and no access to KServe. This is a second, narrower Role for serving only; the existing
+# Role and RoleBinding stay untouched.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: pipeline-runner-serving
+  namespace: kubeflow
+rules:
+  # Publish creates or patches the InferenceService and reads it while it waits for Ready.
+  # No delete: the pipeline never removes the endpoint.
+  - apiGroups: ["serving.kserve.io"]
+    resources: ["inferenceservices"]
+    verbs: ["get", "create", "patch"]
+  # Publish checks that the runtime exists before it creates anything.
+  - apiGroups: ["serving.kserve.io"]
+    resources: ["servingruntimes"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: pipeline-runner-serving-binding
+  namespace: kubeflow
+subjects:
+  - kind: ServiceAccount
+    name: pipeline-runner
+    namespace: kubeflow
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: pipeline-runner-serving

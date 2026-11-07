@@ -372,3 +372,271 @@ Gotchas:
 - **`MlflowClient` retries are not enough, but a run retry is.** The drivers of KFP have no `retryStrategy` in the Argo workflow. `Client(host=...)._run_api.run_service_retry_run(run_id)` (a private attribute of the SDK, and the KFP UI has the same Retry button) re-creates only the pods that failed and keeps the finished steps, so a run that fell at the Gate repeats Gate and Register in about 2 minutes and not the 5 of the whole training. It worked at the second try for the first run, and three retries of the second run failed in a row (two more were refused by the KFP API with a 500). The client of `submit_pipeline.py --wait` can also die with that 500 while the run goes on.
 - **Failed attempts leave pods in `Error`.** Delete them (they are ours: `kubectl delete pod -n kubeflow <name>`) before the hygiene check above, and delete the probe pods after any network test.
 - **`timeout` does not exist on macOS**, and `sh` in the `metadata-grpc` image has no `/dev/tcp` (a failed test with it was an artifact, not a network failure). That image has `bash` and `getent` but no `nc`, `curl` or `python3`.
+
+## Deploy pipeline (SPEC 07, E3)
+
+Pipeline 2 serves whatever is `churn@champion`: `fetch_champion` writes `models/churn/v<N>/model.joblib` on the PVC, `publish` creates or patches the InferenceService `churn` on that folder and waits until the new pod answers, and `smoke_test` checks that the endpoint returns the probabilities of that file. Each part is explained, with what was measured, in the subsections below.
+
+**In order, from a stopped cluster** (each line is explained below; the commands were the ones actually run):
+
+```bash
+minikube start                                                    # then wait a few minutes for the pods to settle
+kubectl apply -f k8s/rbac-pipeline-runner.yaml                    # once: Role + RoleBinding (step 3)
+minikube image build -t churn-sklearnserver:0.1.0 docker/churn-sklearnserver   # once: the serving image (step 4)
+kubectl apply -f k8s/serving-runtime.yaml                         # once: the ServingRuntime (step 5)
+kubectl port-forward -n kubeflow svc/ml-pipeline 8888:8888        # KFP API, in another terminal
+uv run python tools/submit_pipeline.py --pipeline deploy --wait   # syncs churn-code, compiles, submits, waits up to 15 min
+kubectl get isvc churn -n kubeflow                                # READY=True; the annotation churn/model-version says which version
+kubectl port-forward -n kubeflow svc/churn-predictor 18080:80     # then POST {"instances": [[...10 raw values...]]} to :18080/v1/models/churn:predict
+kubectl get pods -A --no-headers | awk '$4!="Running" && $4!="Completed"'   # hygiene: prints nothing (delete Error pods of failed attempts)
+```
+
+If the run fails inside a KFP pod with `dial tcp <metadata-grpc>:8080: i/o timeout`, it is the flake described under "Deploy runs on the cluster", not a bug in the components: retry the same run (and wait on the workflow, not on the API client).
+
+### Constants and RBAC (steps 1 and 3)
+
+Step 1 added seven constants to `components/config.py` (`PVC_CLAIM_NAME`, `K8S_NAMESPACE`, `ISVC_NAME`, `SERVING_RUNTIME_NAME`, `PUBLISH_TIMEOUT_S`, `SMOKE_ROWS`, `SMOKE_TOLERANCE`), which travel in the ConfigMap `churn-code`, so `tools/sync_code.sh` did not change. Step 3 applied the RBAC:
+
+```bash
+kubectl apply -f k8s/rbac-pipeline-runner.yaml
+SA=system:serviceaccount:kubeflow:pipeline-runner
+kubectl auth can-i get inferenceservices.serving.kserve.io -n kubeflow --as=$SA      # also create and patch: yes; delete: no
+kubectl auth can-i get servingruntimes.serving.kserve.io -n kubeflow --as=$SA        # also list: yes; delete: no
+```
+
+A Role named `pipeline-runner` already existed in `kubeflow` (pods, PVCs, ConfigMaps, Argo workflows, `kubeflow.org`; nothing on KServe), so the new Role is called `pipeline-runner-serving` with the RoleBinding `pipeline-runner-serving-binding`, and the existing Role and binding were left alone. Before the apply, `can-i` printed `no` for everything on `serving.kserve.io`. The existing Role already lets `pipeline-runner` read Deployments and pods (`can-i get deployments.apps` and `get`/`list pods` print `yes`), which Publish uses to follow the rollout.
+
+### Cluster assumptions checked before building anything (step 2)
+
+Read on 2026-11-06 after `minikube start` (the cluster had been stopped since 2026-11-04). The start warned about low disk in the Docker VM, and the node showed `/var` at 89 % with 6.3 GB free, the same as before. `cpu.max` was still `800000 100000`. After about two minutes every deployment of `kube-system`, `cert-manager`, `kserve`, `kubeflow` and `mlflow` was `Available`, and no pod was outside `Running` or `Completed`. `minikube start` reports Kubernetes v1.32.0, not the v1.29 that README §4 says.
+
+```bash
+kubectl get rolebinding,clusterrolebinding -A -o json        # who is bound to pipeline-runner
+kubectl get role pipeline-runner -n kubeflow -o yaml          # what that Role allows
+kubectl auth can-i <verb> inferenceservices.serving.kserve.io -n kubeflow --as=system:serviceaccount:kubeflow:pipeline-runner
+kubectl get clusterservingruntime kserve-sklearnserver -o yaml
+kubectl run cb-k8s-check -n default --image=churn-base:0.3.0 --image-pull-policy=Never --restart=Never --rm -i --quiet --command -- python -c "import kubernetes; print(kubernetes.__version__)"
+kubectl run ss-check -n default --image=kserve/sklearnserver:v0.21.0 --restart=Never --rm -i --quiet --command -- sh -c '<id, python, libgomp, versions>'
+```
+
+| Question | Answer | Evidence |
+|---|---|---|
+| Service account of the KFP step pods | **`pipeline-runner`**, confirmed in step 10 (it was first inferred, not observed) | The service account `pipeline-runner` exists in `kubeflow` and has a `RoleBinding` `pipeline-runner-binding` to a Role `pipeline-runner`. The `ml-pipeline` deployment sets no `DEFAULTPIPELINERUNNERSERVICEACCOUNT`, so KFP uses its built-in default. When this was checked no run pod was left to read `spec.serviceAccountName` from; in step 10 every pod of a deploy run showed `serviceAccountName: pipeline-runner` |
+| What `pipeline-runner` may do today | Nothing on KServe | `can-i get`, `create`, `patch` and `delete` on `inferenceservices`, and `get` on `servingruntimes`, all printed `no`. The existing Role covers pods, PVCs, ConfigMaps, Argo workflows and `kubeflow.org`, not `serving.kserve.io` |
+| Name of the Role for step 3 | A Role named `pipeline-runner` **already exists** in `kubeflow` | The new Role needs another name (`pipeline-runner-serving`, with the RoleBinding `pipeline-runner-serving-binding`), and the existing Role and binding stay untouched |
+| `churn-base:0.3.0` imports `kubernetes` | yes | `kubernetes 30.1.0` (also `kfp 2.15.0`, Python 3.11.18) |
+| Arguments of `kserve-sklearnserver` | `--model_name={{.Name}}`, `--model_dir=/mnt/models`, `--http_port=8080` | `protocolVersions` v1 and v2, `supportedModelFormats` `sklearn` version `1`, container `kserve-container`, `securityContext` with `runAsNonRoot: true`, `allowPrivilegeEscalation: false`, `drop: [ALL]`. Annotations `prometheus.kserve.io/path: /metrics` and `prometheus.kserve.io/port: "8080"` (useful for E4) |
+| Resources of that runtime | requests and limits of **1 CPU and 2Gi** | The InferenceService of SPEC 07 sets its own `resources` (100m, 256Mi, limit 1Gi). They are **merged field by field**, not replaced (seen on the real pod in step 10): requests 100m and 256Mi, limit memory 1Gi, and the limit CPU `1` still comes from the runtime |
+| User of `kserve/sklearnserver:v0.21.0` | `kserve`, uid 1000 (not root) | `id` in a throwaway pod |
+| `pip` in the image | **No.** The venv `/prod_venv` (Python 3.11.16) has no `pip` and the image has no `uv` | `python -m pip` fails with `No module named pip`. `ensurepip` is available. The user `kserve` **can write** to `/prod_venv/lib/python3.11/site-packages` |
+| `libgomp.so.1` in the image | **No system library.** Only a copy inside `scikit_learn.libs/libgomp-d22c30c5.so.1.0.0` | `ldconfig -p` has no match. `/usr/bin/apt-get` exists but needs root. Debian 12, `aarch64` |
+| Versions in the image (baseline for the `pip freeze` check of step 4) | `scikit-learn 1.5.2`, `numpy 2.4.4`, `scipy 1.17.1`, `joblib 1.5.3`, `pandas 2.3.3`, `threadpoolctl 3.6.0`, `kserve 0.21.0` | 114 distributions in total. It has no `xgboost`, `lightgbm` or `cloudpickle` |
+
+Gotchas:
+
+- `kubectl get pods` listed the old `churn-training-*` pods in the first seconds after the start and none a few minutes later, so a service account cannot be read from a past run. A direct read needs a live step pod.
+- A bare `kubectl run ... --rm` with `--image-pull-policy=Never` works for `churn-base` because `minikube image build` put it in the node. The `sklearnserver` image was already in the node from the spike, and `IfNotPresent` is enough.
+
+### Derived serving image `churn-sklearnserver:0.1.0` (step 4)
+
+`docker/churn-sklearnserver/Dockerfile` starts from `kserve/sklearnserver:v0.21.0`, installs `libgomp1` as root, installs the three packages of `requirements.txt` (`xgboost`, `lightgbm` and `narwhals`, which `lightgbm` requires) with `uv pip install --no-deps` (uv comes from `ghcr.io/astral-sh/uv:0.11.29` and is only bind-mounted for that `RUN`, so the final image has neither `uv` nor `pip`), and returns to uid 1000. The last `RUN` imports both libraries as that user, so a missing `libgomp` fails the build. The `uv` tag is the version installed on the laptop; if the registry has no such tag, the build fails at the first line and the tag is the thing to change.
+
+```bash
+minikube image build -t churn-sklearnserver:0.1.0 docker/churn-sklearnserver
+minikube image ls | grep churn-sklearn
+```
+
+The check runs `tools/serving_image_check.py` in temporary pods built from `k8s/serving-image-check-pod.yaml` (a template: `sed` fills the name, image and mode). The script and the code reach the pods through the ConfigMaps `serving-image-check` and `churn-code`.
+
+```bash
+kubectl create configmap serving-image-check -n kubeflow \
+  --from-file=serving_image_check.py=tools/serving_image_check.py --dry-run=client -o yaml | kubectl apply -f -
+tools/sync_code.sh        # refreshes churn-code (config.py now has the SPEC 07 constants)
+
+check() {   # check <pod name> <image> <arguments of serving_image_check.py as a YAML flow list body: fit | load | clean | query, --url, <url>, --family, <name>>
+  sed -e "s|__NAME__|$1|" -e "s|__IMAGE__|$2|" -e "s|__ARGS__|$3|" k8s/serving-image-check-pod.yaml | kubectl apply -f -
+  kubectl wait -n kubeflow pod/$1 --for=jsonpath='{.status.containerStatuses[0].state.terminated}' --timeout=240s
+  kubectl logs -n kubeflow $1
+  kubectl get pod -n kubeflow $1 -o jsonpath='exit code: {.status.containerStatuses[0].state.terminated.exitCode}{"\n"}'
+  kubectl delete pod -n kubeflow $1 --wait=false
+}
+check image-check-fit  churn-base:0.3.0            fit     # writes models/image-check/ on the PVC
+check image-check-load churn-sklearnserver:0.1.0   load    # the derived image: all five families ok
+check image-check-orig kserve/sklearnserver:v0.21.0 load   # the original: xgboost and lightgbm fail
+```
+
+`models/image-check/` and the ConfigMap `serving-image-check` are temporary: they are removed at the end of step 5 (`check image-check-clean churn-base:0.3.0 clean`, then `kubectl delete configmap serving-image-check -n kubeflow`).
+
+The script was also run on the laptop, outside the cluster, in a temporary folder: `fit` saved the five files (4.9 MB in total) and `load` printed `ok max_diff=0.000e+00` for the five families. With one file replaced by garbage, `load` printed the error for that family only and exited with code 1.
+
+Observed (2026-11-06):
+
+- **The first build failed at the import check, as designed.** With only `xgboost` and `lightgbm` in `requirements.txt`, the last `RUN` of the Dockerfile failed with `ModuleNotFoundError: No module named 'narwhals'`: `lightgbm 4.7.0` requires `narwhals>=1.15` and `--no-deps` skips it. `xgboost 3.2.0` needs only `numpy` and `scipy`. Adding `narwhals==2.28.0` (the `churn-base` pin) fixed it, and the second build printed `numpy 2.4.4 | scipy 1.17.1 | scikit-learn 1.5.2 | xgboost 3.2.0 | lightgbm 4.7.0` as uid 1000. The `uv` tag `0.11.29` exists in `ghcr.io`, and `RUN --mount=type=bind,from=uv` works with the builder of `minikube image build`. The install took about 13 s (the `xgboost` wheel is 125 MiB), and the `libgomp1` layer was cached on the second build.
+- **The derived image loads the five families.** `fit` in a `churn-base:0.3.0` pod wrote the five files (exit 0). `load` in `churn-sklearnserver:0.1.0` (Python 3.11.16, numpy 2.4.4, scikit-learn 1.5.2) printed `ok max_diff=0.000e+00` for `logreg`, `random_forest`, `hist_gradient_boosting`, `xgboost` and `lightgbm`, exit 0. The models were pickled under numpy 2.4.6 and loaded under 2.4.4 with no difference at all.
+- **The original image fails exactly where expected.** `load` in `kserve/sklearnserver:v0.21.0` passed `logreg`, `random_forest` and `hist_gradient_boosting` and printed `error ModuleNotFoundError: No module named 'xgboost'` and `... 'lightgbm'`, exit 1. So the derived image is what fixes it.
+- **Package comparison.** `pip freeze` cannot run here (neither image has `pip`, by design), so the installed distributions were listed with `importlib.metadata` in both images and compared with `diff`. The original has 114 and the derived 117. The only differences are three added lines: `lightgbm==4.7.0`, `narwhals==2.28.0` and `xgboost==3.2.0`. `scikit-learn` is still `1.5.2`, `numpy` `2.4.4`, `scipy` `1.17.1`, `joblib` `1.5.3` and `pandas` `2.3.3`. Neither `pip` nor `uv` is in the derived image.
+- **Disk.** The node `/var` went from 89 % (6.3 GB free) to 91 % (5.5 GB free) after pulling `uv`, the `xgboost` wheel and the new image layers.
+
+### Serving runtime `churn-sklearnserver` (step 5)
+
+`k8s/serving-runtime.yaml` is a namespaced `ServingRuntime` in `kubeflow` copied from the cluster's `kserve-sklearnserver` (same arguments, resources, `securityContext`, protocol versions and Prometheus annotations). Compared with `diff` on the two `spec` objects, the only difference is the image line. The cluster runtime is not edited.
+
+```bash
+kubectl apply -f k8s/serving-runtime.yaml
+kubectl get servingruntime churn-sklearnserver -n kubeflow -o jsonpath='{.spec.containers[0].image}'   # churn-sklearnserver:0.1.0
+
+# Temporary InferenceService on the xgboost file that step 4 left in models/image-check/
+kubectl apply -f - <<'EOF'
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata: {name: churn-image-check, namespace: kubeflow}
+spec:
+  predictor:
+    minReplicas: 1
+    model:
+      modelFormat: {name: sklearn}
+      runtime: churn-sklearnserver
+      storageUri: pvc://churn-data/models/image-check/xgboost
+      env: [{name: PREDICT_PROBA, value: "true"}]
+      resources: {requests: {cpu: 100m, memory: 256Mi}, limits: {memory: 1Gi}}
+EOF
+kubectl wait --for=condition=Ready isvc/churn-image-check -n kubeflow --timeout=300s
+
+# The query runs inside the cluster, from a pod, against the service name (no port-forward)
+kubectl create configmap serving-image-check -n kubeflow \
+  --from-file=serving_image_check.py=tools/serving_image_check.py --dry-run=client -o yaml | kubectl apply -f -
+check image-check-query churn-base:0.3.0 'query, --url, "http://churn-image-check-predictor.kubeflow.svc.cluster.local/v1/models/churn-image-check:predict", --family, xgboost'
+
+# Cleanup
+kubectl delete isvc churn-image-check -n kubeflow
+check image-check-clean churn-base:0.3.0 clean
+kubectl delete configmap serving-image-check -n kubeflow
+```
+
+Observed (2026-11-06):
+
+- **The runtime serves an XGBoost model.** The InferenceService was `Ready` in 14 s. Its predictor pod ran `churn-sklearnserver:0.1.0` (container `kserve-container`), had no init containers, one extra volume `kserve-pvc-source` (the PVC, mounted by KServe from the `pvc://` URI) and 0 restarts. The query with 3 rows printed `QUERY status=200 shape=(3, 2) max_diff=0.000e+00 ok`: the answer equals the `predict_proba` that the training pod computed, to the last decimal.
+- **Assumptions of the data model confirmed.** In Standard mode the InferenceService creates the service `churn-image-check-predictor` (ClusterIP, port 80), so the endpoint of SPEC 07 follows the pattern `http://<name>-predictor.kubeflow.svc.cluster.local/v1/models/<name>:predict`. `kubectl get isvc` shows a URL `http://<name>-kubeflow.example.com`, which is not reachable and is not the one to use.
+- **Cleanup.** The InferenceService, its predictor pod, the folder `models/image-check/` (a `load` on it now fails with `FileNotFoundError`) and the ConfigMap `serving-image-check` are gone. The ServingRuntime stays. No pod is outside `Running` or `Completed`. The node disk is still 91 % (5.2 GB free).
+
+Gotchas:
+
+- **A pod does not see a ConfigMap change after it starts, and a new pod reads the current one.** After adding the mode `query`, the first query pod ran the old script (`invalid choice: 'query'`) because the ConfigMap `serving-image-check` had not been refreshed. Refresh it (the `kubectl create ... | kubectl apply` line above) after every edit of the script.
+- **Quoting in `kubectl get -o custom-columns=...[0]...` fails in zsh** (`no matches found`), because the brackets are a glob. Quote the argument.
+
+### Fetch champion component (step 6)
+
+`components/fetch_champion.py` has no inputs. It reads the version behind `churn@champion` once (`get_model_version_by_alias`), loads `models:/churn/<N>` (by version), writes `models/churn/v<N>/model.joblib.tmp` and renames it to `model.joblib` with `os.replace`, reloads the final file on the first 3 rows of `processed/train.csv` and checks that `predict_proba` has shape `(3, 2)`. Outputs: `model_version`, `model_dir` and `storage_uri` (`pvc://churn-data/models/churn/v<N>`, with the path taken relative to the mount point of the PVC).
+
+Local check (no cluster), the same method as Gate and Register: call `fetch_champion.python_func()` with `config.MLFLOW_TRACKING_URI` pointed at `sqlite:///<tmp>/mlflow.db` (an experiment created with `artifact_location` in the temporary folder), `config.MODELS_DIR_PVC` and `config.PROCESSED_DIR_PVC` pointed at the temporary folder, and a `train.csv` of 2,000 rows. The versions were registered with `serialization_format="cloudpickle"`, as Register does, one of `logreg` and one of `xgboost`.
+
+Observed (2026-11-06), 12 checks, all passed:
+
+- **One version:** the outputs name version `1`, `model_dir` ends in `models/churn/v1`, `storage_uri` is `pvc://churn-data/models/churn/v1`, and the folder holds only `model.joblib`.
+- **Two versions, alias on 2 (an `xgboost` champion):** it writes `v2`, `v1` keeps the same SHA-256, and the only call to `mlflow.sklearn.load_model` was `models:/churn/2`, not `models:/churn@champion`.
+- **Same version twice:** the second run replaces the file (newer modification time) and the folder holds nothing but `model.joblib` (no `.tmp` left).
+- **No alias:** it raises a `RuntimeError` that names the alias and the model.
+- **No `processed/train.csv`:** it raises `FileNotFoundError` and does not pass in silence.
+
+### Publish component (step 7)
+
+`components/publish.py` takes the `storage_uri` of Fetch and returns the `endpoint`. It takes the version number for the annotation from the end of the URI (`/v<N>`, and it raises on anything else). It checks that the `ServingRuntime` `churn-sklearnserver` exists, then reads the InferenceService `churn`: if it does not exist it calls `create` with the manifest of the spec, and if it does it calls `patch` with the same whole manifest (the Python client sends `application/merge-patch+json`, which replaces lists such as `env` whole, so a patch is the same desired state as a create). Then it polls every 5 s, up to `PUBLISH_TIMEOUT_S` (300 s), until the condition `Ready` is `True` **and** `status.observedGeneration` equals `metadata.generation` (step 10 showed that this is not enough and added a third condition, the Deployment rollout: see "Publish waits for the Deployment rollout" below). Both fields exist in the CRD of KServe 0.21 (`kubectl get crd inferenceservices.serving.kserve.io`, which also has `status.modelStatus`, not used here). The endpoint follows the service name seen in step 5: `http://churn-predictor.kubeflow.svc.cluster.local/v1/models/churn:predict`.
+
+Local check (no cluster): call `publish.python_func(<uri>)` with `kubernetes.config.load_incluster_config` and `kubernetes.client.CustomObjectsApi` replaced by an in-memory stub (it raises `ApiException(404)` for missing objects, bumps `metadata.generation` when a patch changes the spec, and can return a stale status), and `time.sleep` and `time.monotonic` replaced so the loops run on a fake clock.
+
+Observed (2026-11-06), 21 checks, all passed:
+
+- **No InferenceService:** one `create`, no `patch`. The manifest has `runtime: churn-sklearnserver`, the `storageUri` received, `PREDICT_PROBA=true`, the annotation `churn/model-version`, `modelFormat` `sklearn`, `minReplicas` 1, and the resources of the spec (100m and 256Mi, limit 1Gi). It waited for the first reconcile before returning.
+- **Existing InferenceService, new version:** one `patch`, no `create`, with the new `storageUri` and annotation. The stub reported `Ready` from the old revision for the first two reads (generation 2, `observedGeneration` 1), and Publish did not accept it: it slept twice and returned only when `observedGeneration` caught up. With the guard removed from a copy (`if ready:` instead of `if ready and seen:`), that check fails and nothing else does, so the check is not vacuous.
+- **Same version again:** a patch that changes nothing leaves the generation as it is, and Publish returns without waiting.
+- **Missing runtime:** it raises `ServingRuntime 'churn-sklearnserver' does not exist ...` and calls neither `create` nor `patch`.
+- **Never Ready:** it raises after 300 s of the fake clock with the generation, the `observedGeneration` and the conditions in the message.
+- **Forbidden (403):** a 403 on the runtime or on the InferenceService is raised as it is, and is not read as "does not exist" (which would have ended in a `create` that is then also forbidden).
+- **`storage_uri` without `/v<N>`:** it raises `ValueError` before any API call.
+
+What this does not prove: that a real KServe controller moves `observedGeneration` and `Ready` in this order after a `patch`. That is the first real contact with the API server and it happens in step 10.
+
+### Smoke test component (step 8)
+
+`components/smoke_test.py` takes the `endpoint` of Publish and the `model_dir` of Fetch and returns nothing: it passes by finishing and fails by raising. It reads the first 3 rows of `processed/train.csv` in `FEATURES` order (numbers as floats, strings as strings), posts `{"instances": [...]}` to the endpoint with `urllib` (standard library only; `grep -c "import requests\|import httpx"` prints 0), and then checks, in this order: status 200 (only 200, so a 201 fails too), a `predictions` list, shape `(3, 2)`, every value finite and in [0, 1], and finally that the largest difference with `predict_proba` of `model_dir/model.joblib` on the same rows is below `SMOKE_TOLERANCE` (1e-6). That last check is the one that fails for a stale revision: shape and range would pass for any model.
+
+Local check (no cluster): call `smoke_test.python_func(<url>, <model dir>)` against a throwaway `http.server` on `127.0.0.1` whose answer the test chooses. The model is a `logreg` fitted on 2,000 rows, and the "truth" is computed from the JSON that the client sent, which is how the real server receives it.
+
+Observed (2026-11-06), 16 checks, all passed:
+
+- **A correct answer passes**, and the request is what a client sends: 3 rows of 10 values, `Geography` and `Gender` as strings, the other eight as floats, and the first row equal to the first row of `train.csv`. A difference of 5e-7 also passes (below the tolerance).
+- **Status 500, 404 and 201 raise**, and the message carries the status and the start of the body.
+- **Wrong shape raises**: 3 rows of 1 value, and 2 rows instead of 3. An answer without a `predictions` list raises with that cause. The first version of the component let `None` through `np.asarray` and said `shape ()`, which pointed at the wrong thing; it now checks for the list first.
+- **A probability above 1 or below 0 raises**, with the values in the message.
+- **A difference of 1e-5 raises**, and so does the answer of a different model (`[[0.9, 0.1]]` for every row), with "does not serve <model_dir>" in the message.
+- **Nothing listening raises** `POST ... failed: [Errno 61] Connection refused`.
+
+What this does not prove: the name resolution and the path from inside the cluster, which step 5 showed for a temporary service (`<name>-predictor`, port 80) and step 10 shows for `churn`.
+
+### Deploy pipeline wiring (step 9)
+
+`pipelines/deploy_pipeline.py` defines `churn-deploy`: `fetch_champion → publish(storage_uri) → smoke_test(endpoint, model_dir)`, with no parameters. Every task goes through `_configure`, imported from `pipelines/training_pipeline.py`, which is not touched: code ConfigMap `churn-code` at `/code`, PVC `churn-data` at `/mnt/data`, `PYTHONPATH=/code`, no caching, `MLFLOW_HTTP_REQUEST_MAX_RETRIES=10`, `OMP_NUM_THREADS=1`, `IfNotPresent`. `fetch_champion` asks 500m CPU and 512Mi with a 1.5Gi limit and the other two 100m and 256Mi with a 1Gi limit. `publish` does not read the PVC, which it gets only because `_configure` mounts it on every task.
+
+`tools/submit_pipeline.py` takes `--pipeline training|deploy` (default `training`, so the old command is unchanged). A small table maps each name to its function, KFP experiment (`churn-training`, `churn-deploy`) and compiled package; the YAMLs under `pipelines/` are git-ignored.
+
+```bash
+uv run python tools/submit_pipeline.py --compile-only                      # training, as before
+uv run python tools/submit_pipeline.py --pipeline deploy --compile-only    # writes pipelines/deploy_pipeline.yaml
+uv run python tools/submit_pipeline.py --pipeline deploy --wait            # syncs churn-code, submits, waits up to 15 min
+```
+
+Observed (2026-11-06), read from the compiled YAML with `yaml.safe_load_all`:
+
+- Both pipelines compile, and `--pipeline foo` is rejected by `argparse`. `git diff main -- pipelines/training_pipeline.py` is empty.
+- Name `churn-deploy`, and the root has no `inputDefinitions`, so no pipeline parameters.
+- Tasks `fetch-champion` (no dependency), `publish` (depends on `fetch-champion`, takes its `storage_uri`) and `smoke-test` (depends on both, takes `publish.endpoint` and `fetch-champion.model_dir`).
+- The three executors use `churn-base:0.3.0`; the file contains no `0.2.0`.
+- The three tasks mount `churn-data` at `/mnt/data` and `churn-code` at `/code`, and carry the three environment variables above. Their `cachingOptions` is `{}`, the same as the leaf tasks of the training pipeline.
+- `tools/sync_code.sh` is unchanged and still builds `churn-code` with four keys.
+
+### Deploy runs on the cluster (step 10, partial)
+
+Commands: `kubectl port-forward -n kubeflow svc/ml-pipeline 8888:8888`, `uv run python tools/submit_pipeline.py --pipeline deploy --wait`. A failed run is retried with `Client(host=...)._run_api.run_service_retry_run(run_id)`. **Do not wait with `client.wait_for_run_completion`**: it died once with `500 ... lookup mysql ... no such host` while the run went on. Wait on the workflow itself instead: `until` its `.status.phase` is `Succeeded` or `Failed`, in a loop. (`kubectl wait --for=jsonpath='{.status.finishedAt}'` without a value returns at once, and `PIPESTATUS` does not exist in zsh.)
+
+**The KFP flake, measured (2026-11-06).** 9 attempts end to end (submissions and retries): 1 reached `Succeeded`. Every failure had the same cause and the same address, `dial tcp 10.108.123.79:8080: i/o timeout`, which is `metadata-grpc-service`, and it happened in 5 different KFP pods before any of our code ran: `publish-driver` (4 times), `root-driver`, the driver of `smoke-test`, and the launcher of the `fetch-champion` executor (`failed to pre-publish Pod info to ML Metadata`, twice). The driver gives up after 20 s. `metadata-grpc` was `Running`, last restarted two hours before the first failure, and the node load was 0.45 on 12 CPUs. The cause is still not known. The pods of every run use the service account **`pipeline-runner`** (confirmed with `spec.serviceAccountName`).
+
+**First run: `Succeeded`** (after retrying the same run). `fetch-champion` ran in the first attempt, `publish` created the InferenceService (`publish: created InferenceService kubeflow/churn -> pvc://churn-data/models/churn/v2`, then `Ready`), and `smoke_test` printed `smoke test ok: 3 rows, status 200, probabilities in [0, 1], max diff with /mnt/data/models/churn/v2/model.joblib 0.000e+00`. The InferenceService had `churn/model-version=2`, `uid 6519f4b2-2a3e-4286-a18c-4479f2075584`, generation 1, and `/mnt/models` held one file, `model.joblib` (195 KB).
+
+**The predictor pod** (`kubectl get pod ... -o json`): image `churn-sklearnserver:0.1.0`, `args` `--model_name=churn --model_dir=/mnt/models --http_port=8080` (the `{{.Name}}` of the runtime became `churn`), env `PREDICT_PROBA=true` plus `INFERENCE_SERVICE_NAME=churn`, and a single mount `/mnt/models` from the volume `kserve-pvc-source` (claim `churn-data`) with **`subPath: models/churn/v2`**, read only. The service is `churn-predictor`, ClusterIP, port 80.
+
+**The patch, tested outside KFP.** `publish` and `smoke_test` were run as the real components in a pod with the service account `pipeline-runner` (a temporary ConfigMap with the two files and a watcher that logged every change of `generation`, `observedGeneration`, `Ready` and the predictor pods every 0.5 s). Versions 1 and 2 of the model give **identical probabilities** (max difference 0.0 on 50 rows: same seed, params and data), so the smoke test cannot tell them apart in this experiment.
+
+- **Patch that changes nothing (v2 on v2):** `patched`, back in 0.3 s, generation stays 1, and the smoke test passes with difference 0.
+- **Rollout 1, v2 to v1:** generation 1 to 2 at t=5.3 s. `observedGeneration` stayed 1 and `Ready` stayed `True` (from the old revision) until t=22.0 s: **16.7 s of `Ready=True` with a stale `observedGeneration`**. The new pod (`...8xdfm`, subPath v1) went `Pending` at 6.9 s and `Running` at 7.9 s, and the old pod terminated at 18.3 to 19.9 s. `publish` returned at 21 s, after the old pod was gone. Without the `observedGeneration` check it would have returned at about 5 s with the old pod serving. Right after, the smoke test failed with `Temporary failure in name resolution` for `churn-predictor.kubeflow.svc.cluster.local` (a fresh pod resolved it fine 40 s later, in 0.01 s to 0.84 s; one sample, cause unknown).
+- **Rollout 2, v1 to v2 (the restore):** generation 2 to 3 at t=1.6 s, **`observedGeneration` caught up at t=2.7 s with `Ready=True` while the new pod (`...x8g4d`) was still `Pending` and the old pod was the only one serving**. The new pod became `Running` at 3.8 s and the old one started terminating at 14.9 s. `publish` returned at 5.3 s only because it polls every 5 s; a poll at 3 s would have returned with the old pod serving. A DNS probe every 0.5 s saw no failure in this rollout.
+- **Conclusion:** `Ready=True` with `observedGeneration == generation` does **not** mean the new revision is the one answering (rollout 2), and the time the controller takes to update `observedGeneration` varies (about 17 s in rollout 1, about 1 s in rollout 2). This is the case that step 10 of SPEC 07 says to stop on. What replaced it, and the measurement that settled it, is in the next subsection.
+- The experiment left `churn` serving v1 for a few minutes because the script stopped at the failed smoke test; a second pod restored v2 (`churn/model-version=2`, same `uid`, generation 3). The folder `models/churn/v1/` created for the experiment was removed. No temporary pod or ConfigMap is left.
+
+### Publish waits for the Deployment rollout (step 10)
+
+Decision of 2026-11-06 (option 1 of three): after the two rollouts above, `publish` also waits for the rollout of the predictor Deployment `churn-predictor` to be complete. The service account `pipeline-runner` already reads Deployments and pods through its existing Role (`can-i get deployments.apps` and `get`/`list pods` print `yes`), so `k8s/rbac-pipeline-runner.yaml` did not change.
+
+The condition, evaluated on every poll together with the two older ones: the Deployment `observedGeneration` is at least its `metadata.generation`, and `status.replicas`, `status.updatedReplicas` and `status.availableReplicas` all equal `spec.replicas`. A pod that is terminating is not counted in `status.replicas`, so the condition is true only after the old pod stopped receiving traffic. A missing Deployment keeps it waiting and, at the timeout, the message says `Deployment churn-predictor not found`.
+
+Measured with a watcher (every 0.5 s: ISVC `generation`, `observedGeneration`, `Ready`, `modelStatus`, Deployment counters, and each pod's `subPath`, phase and `Ready`), two rollouts per version of the code, always ending with a `finally` that deploys v2 again:
+
+All times are seconds after the `patch` (the clock of the script minus the moment `publish` started):
+
+| Rollout | `publish` before (Ready + `observedGeneration`) returned at | New pod Ready (old pod starts terminating) | `publish` now (+ Deployment) returned at | Condition true at |
+|---|---|---|---|---|
+| v2 to v1 | 5.5 s, with the new pod `Running` but not Ready | 13.4 s (before) and 13.6 s (now) | 15.7 s | 13.6 s |
+| v1 to v2 | 5.3 s, with the new pod `Running` but not Ready | 15.6 s (before) and 13.3 s (now) | 15.9 s | 13.8 s |
+
+- Before the change `publish` returned about 5 s after the patch, while only the old pod could answer and the new pod still needed 8 to 10 s to be Ready, in both rollouts. In the first experiment of step 10 it looked correct (it waited 21 s) only because the controller was slow that time to update `observedGeneration`.
+- After the change it returned 2.1 s and 2.1 s after the condition became true (the poll is every 5 s), and never before it. The condition was `False` during the whole window in which the old pod was the only one Ready. Two rollouts is a small sample.
+- `status.modelStatus.transitionStatus` stayed `UpToDate` for the whole rollout in all four rollouts measured, so it is not a usable signal.
+- A new pod takes about 8 to 10 s from `Running` to Ready, and the old one is deleted only then, so a model change takes about 13 to 16 s from the patch until the new pod answers, and `publish` returns about 16 s after the patch.
+- The measurement ran in a pod with the service account `pipeline-runner` outside KFP, using the real `publish` component (a temporary ConfigMap with the file, removed afterwards). The final state is the champion: `churn/model-version=2`, same `uid`, one predictor pod, and no temporary object.
+
+### Step 10 close-out
+
+- **`curl` from the laptop** (`kubectl port-forward -n kubeflow svc/churn-predictor 18080:80`, port 18080 because the KFP UI may hold 8080): one raw row in `FEATURES` order (`675.0, "France", "Female", 37.0, 5.0, 0.0, 1.0, 1.0, 0.0, 131778.57`) answered `HTTP 200` with `{"predictions":[[0.5072928468077883,0.4927071531922117]]}`. Both values are in [0, 1], and they equal `predict_proba` of `models:/churn@champion` loaded from MLflow on the laptop, with a maximum difference of 0.
+- **One run in KFP reached `Succeeded`, and it used the first version of `publish`** (Ready + `observedGeneration`). The version that also waits for the Deployment rollout was verified in the cluster outside KFP, with the same image, the same service account and the same component code, but it has **not** run inside a KFP pod.
+- **The second run in KFP was not done, by decision of the user** (eight of the nine attempts failed with the same KFP flake, see above, and the patch path had already been exercised outside KFP). So the criterion "the second deploy run finishes `Succeeded` and keeps the same `uid`" is **not met as written**. What exists instead: the patch of `publish` against the real InferenceService ran nine times in a pod (three with the same spec, and six changing between v1 and v2), always with the same `uid` (`6519f4b2-2a3e-4286-a18c-4479f2075584`) and no recreation.
+- **Times.** The workflow of the first run (`churn-deploy-4cdmp`) took 9 min 22 s from the first submission to `Succeeded`, with three retries of the same run in between, so it says little about the cost of a clean run. Inside the cluster, from the logs of that run: the `fetch_champion` pod started at 03:02:52Z and logged `publish success` at 03:03:00Z (about 8 s), and a model change takes about 16 s from the patch to `publish` returning. A clean-run time was not measured.
+- **Hygiene.** The Error pods left by failed attempts were deleted. No pod is outside `Running` or `Completed`, no temporary pod or ConfigMap is left, and the node disk is at 91 % (5.2 GB free). The port-forwards to the KFP API (8888) and MLflow (5001) were still open at this point.

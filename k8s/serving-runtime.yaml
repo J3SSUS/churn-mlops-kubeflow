@@ -1,0 +1,45 @@
+# ServingRuntime for the InferenceService `churn` (SPEC 07).
+# A copy of the cluster's ClusterServingRuntime `kserve-sklearnserver` (read on 2026-11-06 with
+#   kubectl get clusterservingruntime kserve-sklearnserver -o yaml)
+# where only the name and the image change. The image adds xgboost and lightgbm, so a champion of
+# any family can load (docker/churn-sklearnserver). The cluster runtime itself is not edited.
+apiVersion: serving.kserve.io/v1alpha1
+kind: ServingRuntime
+metadata:
+  name: churn-sklearnserver
+  namespace: kubeflow
+  annotations:
+    serving.kserve.io/server-type: sklearnserver
+spec:
+  annotations:
+    prometheus.kserve.io/path: /metrics
+    prometheus.kserve.io/port: "8080"
+  containers:
+    - name: kserve-container
+      image: churn-sklearnserver:0.1.0
+      args:
+        - --model_name={{.Name}}
+        - --model_dir=/mnt/models
+        - --http_port=8080
+      resources:
+        limits:
+          cpu: "1"
+          memory: 2Gi
+        requests:
+          cpu: "1"
+          memory: 2Gi
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop:
+            - ALL
+        privileged: false
+        runAsNonRoot: true
+  protocolVersions:
+    - v1
+    - v2
+  supportedModelFormats:
+    - autoSelect: true
+      name: sklearn
+      priority: 1
+      version: "1"
