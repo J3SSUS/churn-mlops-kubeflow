@@ -372,3 +372,36 @@ Gotchas:
 - **`MlflowClient` retries are not enough, but a run retry is.** The drivers of KFP have no `retryStrategy` in the Argo workflow. `Client(host=...)._run_api.run_service_retry_run(run_id)` (a private attribute of the SDK, and the KFP UI has the same Retry button) re-creates only the pods that failed and keeps the finished steps, so a run that fell at the Gate repeats Gate and Register in about 2 minutes and not the 5 of the whole training. It worked at the second try for the first run, and three retries of the second run failed in a row (two more were refused by the KFP API with a 500). The client of `submit_pipeline.py --wait` can also die with that 500 while the run goes on.
 - **Failed attempts leave pods in `Error`.** Delete them (they are ours: `kubectl delete pod -n kubeflow <name>`) before the hygiene check above, and delete the probe pods after any network test.
 - **`timeout` does not exist on macOS**, and `sh` in the `metadata-grpc` image has no `/dev/tcp` (a failed test with it was an artifact, not a network failure). That image has `bash` and `getent` but no `nc`, `curl` or `python3`.
+
+## Deploy pipeline (SPEC 07, E3)
+
+### Cluster assumptions checked before building anything (step 2)
+
+Read on 2026-11-06 after `minikube start` (the cluster had been stopped since 2026-11-04). The start warned about low disk in the Docker VM, and the node showed `/var` at 89 % with 6.3 GB free, the same as before. `cpu.max` was still `800000 100000`. After about two minutes every deployment of `kube-system`, `cert-manager`, `kserve`, `kubeflow` and `mlflow` was `Available`, and no pod was outside `Running` or `Completed`. `minikube start` reports Kubernetes v1.32.0, not the v1.29 that README §4 says.
+
+```bash
+kubectl get rolebinding,clusterrolebinding -A -o json        # who is bound to pipeline-runner
+kubectl get role pipeline-runner -n kubeflow -o yaml          # what that Role allows
+kubectl auth can-i <verb> inferenceservices.serving.kserve.io -n kubeflow --as=system:serviceaccount:kubeflow:pipeline-runner
+kubectl get clusterservingruntime kserve-sklearnserver -o yaml
+kubectl run cb-k8s-check -n default --image=churn-base:0.3.0 --image-pull-policy=Never --restart=Never --rm -i --quiet --command -- python -c "import kubernetes; print(kubernetes.__version__)"
+kubectl run ss-check -n default --image=kserve/sklearnserver:v0.21.0 --restart=Never --rm -i --quiet --command -- sh -c '<id, python, libgomp, versions>'
+```
+
+| Question | Answer | Evidence |
+|---|---|---|
+| Service account of the KFP step pods | **Not observed directly; most likely `pipeline-runner`.** Step 10 confirms it | The service account `pipeline-runner` exists in `kubeflow` and has a `RoleBinding` `pipeline-runner-binding` to a Role `pipeline-runner`. The `ml-pipeline` deployment sets no `DEFAULTPIPELINERUNNERSERVICEACCOUNT`, so KFP uses its built-in default. No run pod was left to read `spec.serviceAccountName` from, and no pod uses that account right now |
+| What `pipeline-runner` may do today | Nothing on KServe | `can-i get`, `create`, `patch` and `delete` on `inferenceservices`, and `get` on `servingruntimes`, all printed `no`. The existing Role covers pods, PVCs, ConfigMaps, Argo workflows and `kubeflow.org`, not `serving.kserve.io` |
+| Name of the Role for step 3 | A Role named `pipeline-runner` **already exists** in `kubeflow` | The new Role needs another name (`pipeline-runner-serving`, with the RoleBinding `pipeline-runner-serving-binding`), and the existing Role and binding stay untouched |
+| `churn-base:0.3.0` imports `kubernetes` | yes | `kubernetes 30.1.0` (also `kfp 2.15.0`, Python 3.11.18) |
+| Arguments of `kserve-sklearnserver` | `--model_name={{.Name}}`, `--model_dir=/mnt/models`, `--http_port=8080` | `protocolVersions` v1 and v2, `supportedModelFormats` `sklearn` version `1`, container `kserve-container`, `securityContext` with `runAsNonRoot: true`, `allowPrivilegeEscalation: false`, `drop: [ALL]`. Annotations `prometheus.kserve.io/path: /metrics` and `prometheus.kserve.io/port: "8080"` (useful for E4) |
+| Resources of that runtime | requests and limits of **1 CPU and 2Gi** | The InferenceService of SPEC 07 sets its own `resources` (100m, 256Mi, limit 1Gi), which replace these |
+| User of `kserve/sklearnserver:v0.21.0` | `kserve`, uid 1000 (not root) | `id` in a throwaway pod |
+| `pip` in the image | **No.** The venv `/prod_venv` (Python 3.11.16) has no `pip` and the image has no `uv` | `python -m pip` fails with `No module named pip`. `ensurepip` is available. The user `kserve` **can write** to `/prod_venv/lib/python3.11/site-packages` |
+| `libgomp.so.1` in the image | **No system library.** Only a copy inside `scikit_learn.libs/libgomp-d22c30c5.so.1.0.0` | `ldconfig -p` has no match. `/usr/bin/apt-get` exists but needs root. Debian 12, `aarch64` |
+| Versions in the image (baseline for the `pip freeze` check of step 4) | `scikit-learn 1.5.2`, `numpy 2.4.4`, `scipy 1.17.1`, `joblib 1.5.3`, `pandas 2.3.3`, `threadpoolctl 3.6.0`, `kserve 0.21.0` | 114 distributions in total. It has no `xgboost`, `lightgbm` or `cloudpickle` |
+
+Gotchas:
+
+- `kubectl get pods` listed the old `churn-training-*` pods in the first seconds after the start and none a few minutes later, so a service account cannot be read from a past run. A direct read needs a live step pod.
+- A bare `kubectl run ... --rm` with `--image-pull-policy=Never` works for `churn-base` because `minikube image build` put it in the node. The `sklearnserver` image was already in the node from the spike, and `IfNotPresent` is enough.
