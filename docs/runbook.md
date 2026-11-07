@@ -506,3 +506,21 @@ Observed (2026-11-06), 12 checks, all passed:
 - **Same version twice:** the second run replaces the file (newer modification time) and the folder holds nothing but `model.joblib` (no `.tmp` left).
 - **No alias:** it raises a `RuntimeError` that names the alias and the model.
 - **No `processed/train.csv`:** it raises `FileNotFoundError` and does not pass in silence.
+
+### Publish component (step 7)
+
+`components/publish.py` takes the `storage_uri` of Fetch and returns the `endpoint`. It takes the version number for the annotation from the end of the URI (`/v<N>`, and it raises on anything else). It checks that the `ServingRuntime` `churn-sklearnserver` exists, then reads the InferenceService `churn`: if it does not exist it calls `create` with the manifest of the spec, and if it does it calls `patch` with the same whole manifest (the Python client sends `application/merge-patch+json`, which replaces lists such as `env` whole, so a patch is the same desired state as a create). Then it polls every 5 s, up to `PUBLISH_TIMEOUT_S` (300 s), until the condition `Ready` is `True` **and** `status.observedGeneration` equals `metadata.generation`. Both fields exist in the CRD of KServe 0.21 (`kubectl get crd inferenceservices.serving.kserve.io`, which also has `status.modelStatus`, not used here). The endpoint follows the service name seen in step 5: `http://churn-predictor.kubeflow.svc.cluster.local/v1/models/churn:predict`.
+
+Local check (no cluster): call `publish.python_func(<uri>)` with `kubernetes.config.load_incluster_config` and `kubernetes.client.CustomObjectsApi` replaced by an in-memory stub (it raises `ApiException(404)` for missing objects, bumps `metadata.generation` when a patch changes the spec, and can return a stale status), and `time.sleep` and `time.monotonic` replaced so the loops run on a fake clock.
+
+Observed (2026-11-06), 21 checks, all passed:
+
+- **No InferenceService:** one `create`, no `patch`. The manifest has `runtime: churn-sklearnserver`, the `storageUri` received, `PREDICT_PROBA=true`, the annotation `churn/model-version`, `modelFormat` `sklearn`, `minReplicas` 1, and the resources of the spec (100m and 256Mi, limit 1Gi). It waited for the first reconcile before returning.
+- **Existing InferenceService, new version:** one `patch`, no `create`, with the new `storageUri` and annotation. The stub reported `Ready` from the old revision for the first two reads (generation 2, `observedGeneration` 1), and Publish did not accept it: it slept twice and returned only when `observedGeneration` caught up. With the guard removed from a copy (`if ready:` instead of `if ready and seen:`), that check fails and nothing else does, so the check is not vacuous.
+- **Same version again:** a patch that changes nothing leaves the generation as it is, and Publish returns without waiting.
+- **Missing runtime:** it raises `ServingRuntime 'churn-sklearnserver' does not exist ...` and calls neither `create` nor `patch`.
+- **Never Ready:** it raises after 300 s of the fake clock with the generation, the `observedGeneration` and the conditions in the message.
+- **Forbidden (403):** a 403 on the runtime or on the InferenceService is raised as it is, and is not read as "does not exist" (which would have ended in a `create` that is then also forbidden).
+- **`storage_uri` without `/v<N>`:** it raises `ValueError` before any API call.
+
+What this does not prove: that a real KServe controller moves `observedGeneration` and `Ready` in this order after a `patch`. That is the first real contact with the API server and it happens in step 10.
