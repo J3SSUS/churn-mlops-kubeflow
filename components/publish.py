@@ -1,5 +1,6 @@
 """Publish step (Pipeline 2): create or patch the KServe InferenceService `churn` so that it serves
-the model folder that Fetch wrote, then wait until it is Ready.
+the model folder that Fetch wrote, then wait until it is Ready and the rollout of the predictor Deployment
+is complete (the new pod answers and the old one is gone).
 
 The manifest is built here and not kept as a YAML in the repo, because the `storageUri` changes
 with every model version. The runtime `churn-sklearnserver` is checked first, so a missing
@@ -77,22 +78,45 @@ def publish(storage_uri: str) -> NamedTuple("Outputs", [("endpoint", str)]):
         api.patch_namespaced_custom_object("serving.kserve.io", "v1beta1", namespace, "inferenceservices", name, manifest)
         print(f"publish: patched InferenceService {namespace}/{name} -> {storage_uri}")
 
-    # Ready is not enough on its own: right after a patch the object can still report Ready from the
-    # old revision. So also wait for the controller to have seen the current generation.
+    apps = client.AppsV1Api()
+
+    def rollout():
+        """(done, detail) for the predictor Deployment: the controller has seen its latest generation
+        and every wanted replica is the new one and available. Replicas that are terminating are
+        not counted, so this is true only once the old pod has stopped receiving traffic."""
+        try:
+            dep = apps.read_namespaced_deployment(f"{name}-predictor", namespace)
+        except ApiException as e:
+            if e.status == 404:
+                return False, f"Deployment {name}-predictor not found"
+            raise
+        st, want = dep.status, (1 if dep.spec.replicas is None else dep.spec.replicas)
+        done = (
+            (st.observed_generation or 0) >= dep.metadata.generation
+            and (st.replicas or 0) == want and (st.updated_replicas or 0) == want and (st.available_replicas or 0) == want
+        )
+        return done, (f"Deployment {name}-predictor: wanted {want}, replicas {st.replicas}, "
+                      f"updated {st.updated_replicas}, available {st.available_replicas}")
+
+    # Neither Ready nor observedGeneration is enough on its own. Measured on this cluster (docs/runbook.md):
+    # right after a patch the InferenceService stays Ready from the old revision, and observedGeneration can
+    # catch up while the new pod is still not Ready and the old one is the only one answering. So wait for the
+    # InferenceService (Ready, current generation seen) AND for the Deployment rollout to be complete.
     deadline = time.monotonic() + config.PUBLISH_TIMEOUT_S
     while True:
         isvc = get("serving.kserve.io", "v1beta1", "inferenceservices", name) or {}
         status = isvc.get("status", {})
         ready = any(c.get("type") == "Ready" and c.get("status") == "True" for c in status.get("conditions", []))
         seen = status.get("observedGeneration") == isvc.get("metadata", {}).get("generation")
-        if ready and seen:
+        rolled_out, rollout_detail = rollout()
+        if ready and seen and rolled_out:
             break
         if time.monotonic() >= deadline:
             conditions = [(c.get("type"), c.get("status"), c.get("reason")) for c in status.get("conditions", [])]
             raise RuntimeError(
                 f"InferenceService {namespace}/{name} was not Ready within {config.PUBLISH_TIMEOUT_S}s "
                 f"(generation {isvc.get('metadata', {}).get('generation')}, observedGeneration "
-                f"{status.get('observedGeneration')}, conditions {conditions})"
+                f"{status.get('observedGeneration')}, conditions {conditions}; {rollout_detail})"
             )
         time.sleep(5)
 

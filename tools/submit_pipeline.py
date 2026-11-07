@@ -1,4 +1,7 @@
-"""Sync the shared code, compile the training pipeline and submit a run (SPEC 04).
+"""Sync the shared code, compile a pipeline and submit a run (SPEC 04, SPEC 07).
+
+    uv run python tools/submit_pipeline.py --wait                      # Pipeline 1, training (the default)
+    uv run python tools/submit_pipeline.py --pipeline deploy --wait    # Pipeline 2, deploy
 
 Needs a port-forward to the KFP API:
     kubectl port-forward -n kubeflow svc/ml-pipeline 8888:8888
@@ -14,21 +17,27 @@ from kfp import Client, compiler
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+from pipelines.deploy_pipeline import deploy_pipeline  # noqa: E402
 from pipelines.training_pipeline import training_pipeline  # noqa: E402
 
-PACKAGE = ROOT / "pipelines" / "training_pipeline.yaml"
-EXPERIMENT = "churn-training"
+# name -> (pipeline function, KFP experiment, compiled package). The YAMLs are git-ignored.
+PIPELINES = {
+    "training": (training_pipeline, "churn-training", ROOT / "pipelines" / "training_pipeline.yaml"),
+    "deploy": (deploy_pipeline, "churn-deploy", ROOT / "pipelines" / "deploy_pipeline.yaml"),
+}
 
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--pipeline", choices=sorted(PIPELINES), default="training", help="which pipeline (default: training)")
     parser.add_argument("--host", default="http://localhost:8888")
     parser.add_argument("--compile-only", action="store_true", help="compile the YAML and stop")
     parser.add_argument("--wait", action="store_true", help="wait until the run finishes")
     args = parser.parse_args()
+    pipeline_func, experiment, package = PIPELINES[args.pipeline]
 
-    compiler.Compiler().compile(training_pipeline, str(PACKAGE))
-    print(f"compiled: {PACKAGE.relative_to(ROOT)}")
+    compiler.Compiler().compile(pipeline_func, str(package))
+    print(f"compiled: {package.relative_to(ROOT)}")
     if args.compile_only:
         return
 
@@ -36,10 +45,10 @@ def main():
 
     client = Client(host=args.host)
     run = client.create_run_from_pipeline_package(
-        str(PACKAGE),
+        str(package),
         arguments={},
-        run_name=f"churn-training-{datetime.now():%Y%m%d-%H%M%S}",
-        experiment_name=EXPERIMENT,
+        run_name=f"churn-{args.pipeline}-{datetime.now():%Y%m%d-%H%M%S}",
+        experiment_name=experiment,
     )
     print(f"run submitted: {run.run_id}")
     if args.wait:
