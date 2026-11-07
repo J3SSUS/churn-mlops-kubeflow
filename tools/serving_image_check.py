@@ -7,6 +7,8 @@ Modes:
   load   in any image (churn-sklearnserver, or the original kserve/sklearnserver): load each
          model.joblib, compare predict_proba with expected.json, print one RESULT line per family.
          Exits 1 if any family fails to load or differs by SMOKE_TOLERANCE or more.
+  query  in a pod, against a live endpoint: POST the first rows of expected.json to --url and compare
+         the answer with the expected values of --family (used for the temporary InferenceService).
   clean  remove models/image-check from the PVC.
 
 The code comes from the ConfigMap churn-code (PYTHONPATH=/code) and the script from the ConfigMap
@@ -86,6 +88,29 @@ def load(models_dir):
     return 1 if failed else 0
 
 
+def query(models_dir, url, family, rows):
+    """POST the first `rows` rows of expected.json to a live endpoint and compare the answer."""
+    import urllib.error
+    import urllib.request
+
+    ref = json.loads((Path(models_dir) / CHECK_DIR / "expected.json").read_text())
+    body = json.dumps({"instances": ref["instances"][:rows]}).encode()
+    request = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            status, answer = response.status, json.loads(response.read())
+    except urllib.error.HTTPError as exc:
+        print(f"QUERY status={exc.code} body={exc.read().decode()[:300]}")
+        return 1
+    predictions = np.asarray(answer["predictions"], dtype=float)
+    expected = np.asarray(ref["expected"][family][:rows])
+    ok = predictions.shape == expected.shape
+    diff = float(np.abs(predictions - expected).max()) if ok else float("nan")
+    ok = ok and diff < config.SMOKE_TOLERANCE
+    print(f"QUERY status={status} shape={predictions.shape} max_diff={diff:.3e} {'ok' if ok else 'FAILED'}")
+    return 0 if ok else 1
+
+
 def clean(models_dir):
     shutil.rmtree(Path(models_dir) / CHECK_DIR, ignore_errors=True)
     print(f"CLEAN removed {Path(models_dir) / CHECK_DIR}")
@@ -94,15 +119,22 @@ def clean(models_dir):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("mode", choices=["fit", "load", "clean"])
+    parser.add_argument("mode", choices=["fit", "load", "query", "clean"])
     parser.add_argument("--raw-dir", default=config.RAW_DIR_PVC)
     parser.add_argument("--models-dir", default=config.MODELS_DIR_PVC)
     parser.add_argument("--tuning-config", default=None, help="default: config.TUNING_CONFIG_PATH")
+    parser.add_argument("--url", help="query: the :predict URL of the endpoint")
+    parser.add_argument("--family", help="query: which family's expected values to compare with")
+    parser.add_argument("--rows", type=int, default=config.SMOKE_ROWS, help="query: how many rows to send")
     args = parser.parse_args()
     if args.mode == "fit":
         return fit(args.raw_dir, args.models_dir, args.tuning_config)
     if args.mode == "load":
         return load(args.models_dir)
+    if args.mode == "query":
+        if not (args.url and args.family):
+            parser.error("query needs --url and --family")
+        return query(args.models_dir, args.url, args.family, args.rows)
     return clean(args.models_dir)
 
 

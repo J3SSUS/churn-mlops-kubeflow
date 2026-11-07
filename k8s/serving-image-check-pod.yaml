@@ -1,6 +1,7 @@
 # TEMPLATE for the temporary pods of the serving image check (SPEC 07, step 4).
-# Not applied as is: __NAME__, __IMAGE__ and __MODE__ are filled with sed (see docs/runbook.md).
-#   __MODE__ = fit | load | clean   (tools/serving_image_check.py)
+# Not applied as is: __NAME__, __IMAGE__ and __ARGS__ are filled with sed (see docs/runbook.md).
+#   __ARGS__ = the arguments of tools/serving_image_check.py as a YAML flow list body, for example
+#              `load`, or `query, --url, http://<svc>/v1/models/<name>:predict, --family, xgboost`
 # The code comes from the ConfigMaps churn-code (/code) and serving-image-check (/check).
 # Delete the pod, the ConfigMap and models/image-check on the PVC afterwards.
 apiVersion: v1
@@ -14,7 +15,8 @@ spec:
     - name: check
       image: __IMAGE__
       imagePullPolicy: IfNotPresent
-      command: ["python", "/check/serving_image_check.py", "__MODE__"]
+      command: ["python", "/check/serving_image_check.py"]
+      args: [__ARGS__]
       env:
         # Overrides the PYTHONPATH of the server image (/sklearnserver): the script needs only /code.
         - name: PYTHONPATH

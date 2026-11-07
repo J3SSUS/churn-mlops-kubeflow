@@ -422,8 +422,8 @@ kubectl create configmap serving-image-check -n kubeflow \
   --from-file=serving_image_check.py=tools/serving_image_check.py --dry-run=client -o yaml | kubectl apply -f -
 tools/sync_code.sh        # refreshes churn-code (config.py now has the SPEC 07 constants)
 
-check() {   # check <pod name> <image> <fit|load|clean>
-  sed -e "s|__NAME__|$1|" -e "s|__IMAGE__|$2|" -e "s|__MODE__|$3|" k8s/serving-image-check-pod.yaml | kubectl apply -f -
+check() {   # check <pod name> <image> <arguments of serving_image_check.py as a YAML flow list body: fit | load | clean | query, --url, <url>, --family, <name>>
+  sed -e "s|__NAME__|$1|" -e "s|__IMAGE__|$2|" -e "s|__ARGS__|$3|" k8s/serving-image-check-pod.yaml | kubectl apply -f -
   kubectl wait -n kubeflow pod/$1 --for=jsonpath='{.status.containerStatuses[0].state.terminated}' --timeout=240s
   kubectl logs -n kubeflow $1
   kubectl get pod -n kubeflow $1 -o jsonpath='exit code: {.status.containerStatuses[0].state.terminated.exitCode}{"\n"}'
@@ -445,3 +445,50 @@ Observed (2026-11-06):
 - **The original image fails exactly where expected.** `load` in `kserve/sklearnserver:v0.21.0` passed `logreg`, `random_forest` and `hist_gradient_boosting` and printed `error ModuleNotFoundError: No module named 'xgboost'` and `... 'lightgbm'`, exit 1. So the derived image is what fixes it.
 - **Package comparison.** `pip freeze` cannot run here (neither image has `pip`, by design), so the installed distributions were listed with `importlib.metadata` in both images and compared with `diff`. The original has 114 and the derived 117. The only differences are three added lines: `lightgbm==4.7.0`, `narwhals==2.28.0` and `xgboost==3.2.0`. `scikit-learn` is still `1.5.2`, `numpy` `2.4.4`, `scipy` `1.17.1`, `joblib` `1.5.3` and `pandas` `2.3.3`. Neither `pip` nor `uv` is in the derived image.
 - **Disk.** The node `/var` went from 89 % (6.3 GB free) to 91 % (5.5 GB free) after pulling `uv`, the `xgboost` wheel and the new image layers.
+
+### Serving runtime `churn-sklearnserver` (step 5)
+
+`k8s/serving-runtime.yaml` is a namespaced `ServingRuntime` in `kubeflow` copied from the cluster's `kserve-sklearnserver` (same arguments, resources, `securityContext`, protocol versions and Prometheus annotations). Compared with `diff` on the two `spec` objects, the only difference is the image line. The cluster runtime is not edited.
+
+```bash
+kubectl apply -f k8s/serving-runtime.yaml
+kubectl get servingruntime churn-sklearnserver -n kubeflow -o jsonpath='{.spec.containers[0].image}'   # churn-sklearnserver:0.1.0
+
+# Temporary InferenceService on the xgboost file that step 4 left in models/image-check/
+kubectl apply -f - <<'EOF'
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata: {name: churn-image-check, namespace: kubeflow}
+spec:
+  predictor:
+    minReplicas: 1
+    model:
+      modelFormat: {name: sklearn}
+      runtime: churn-sklearnserver
+      storageUri: pvc://churn-data/models/image-check/xgboost
+      env: [{name: PREDICT_PROBA, value: "true"}]
+      resources: {requests: {cpu: 100m, memory: 256Mi}, limits: {memory: 1Gi}}
+EOF
+kubectl wait --for=condition=Ready isvc/churn-image-check -n kubeflow --timeout=300s
+
+# The query runs inside the cluster, from a pod, against the service name (no port-forward)
+kubectl create configmap serving-image-check -n kubeflow \
+  --from-file=serving_image_check.py=tools/serving_image_check.py --dry-run=client -o yaml | kubectl apply -f -
+check image-check-query churn-base:0.3.0 'query, --url, "http://churn-image-check-predictor.kubeflow.svc.cluster.local/v1/models/churn-image-check:predict", --family, xgboost'
+
+# Cleanup
+kubectl delete isvc churn-image-check -n kubeflow
+check image-check-clean churn-base:0.3.0 clean
+kubectl delete configmap serving-image-check -n kubeflow
+```
+
+Observed (2026-11-06):
+
+- **The runtime serves an XGBoost model.** The InferenceService was `Ready` in 14 s. Its predictor pod ran `churn-sklearnserver:0.1.0` (container `kserve-container`), had no init containers, one extra volume `kserve-pvc-source` (the PVC, mounted by KServe from the `pvc://` URI) and 0 restarts. The query with 3 rows printed `QUERY status=200 shape=(3, 2) max_diff=0.000e+00 ok`: the answer equals the `predict_proba` that the training pod computed, to the last decimal.
+- **Assumptions of the data model confirmed.** In Standard mode the InferenceService creates the service `churn-image-check-predictor` (ClusterIP, port 80), so the endpoint of SPEC 07 follows the pattern `http://<name>-predictor.kubeflow.svc.cluster.local/v1/models/<name>:predict`. `kubectl get isvc` shows a URL `http://<name>-kubeflow.example.com`, which is not reachable and is not the one to use.
+- **Cleanup.** The InferenceService, its predictor pod, the folder `models/image-check/` (a `load` on it now fails with `FileNotFoundError`) and the ConfigMap `serving-image-check` are gone. The ServingRuntime stays. No pod is outside `Running` or `Completed`. The node disk is still 91 % (5.2 GB free).
+
+Gotchas:
+
+- **A pod does not see a ConfigMap change after it starts, and a new pod reads the current one.** After adding the mode `query`, the first query pod ran the old script (`invalid choice: 'query'`) because the ConfigMap `serving-image-check` had not been refreshed. Refresh it (the `kubectl create ... | kubectl apply` line above) after every edit of the script.
+- **Quoting in `kubectl get -o custom-columns=...[0]...` fails in zsh** (`no matches found`), because the brackets are a glob. Quote the argument.
