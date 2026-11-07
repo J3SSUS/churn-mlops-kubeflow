@@ -492,3 +492,17 @@ Gotchas:
 
 - **A pod does not see a ConfigMap change after it starts, and a new pod reads the current one.** After adding the mode `query`, the first query pod ran the old script (`invalid choice: 'query'`) because the ConfigMap `serving-image-check` had not been refreshed. Refresh it (the `kubectl create ... | kubectl apply` line above) after every edit of the script.
 - **Quoting in `kubectl get -o custom-columns=...[0]...` fails in zsh** (`no matches found`), because the brackets are a glob. Quote the argument.
+
+### Fetch champion component (step 6)
+
+`components/fetch_champion.py` has no inputs. It reads the version behind `churn@champion` once (`get_model_version_by_alias`), loads `models:/churn/<N>` (by version), writes `models/churn/v<N>/model.joblib.tmp` and renames it to `model.joblib` with `os.replace`, reloads the final file on the first 3 rows of `processed/train.csv` and checks that `predict_proba` has shape `(3, 2)`. Outputs: `model_version`, `model_dir` and `storage_uri` (`pvc://churn-data/models/churn/v<N>`, with the path taken relative to the mount point of the PVC).
+
+Local check (no cluster), the same method as Gate and Register: call `fetch_champion.python_func()` with `config.MLFLOW_TRACKING_URI` pointed at `sqlite:///<tmp>/mlflow.db` (an experiment created with `artifact_location` in the temporary folder), `config.MODELS_DIR_PVC` and `config.PROCESSED_DIR_PVC` pointed at the temporary folder, and a `train.csv` of 2,000 rows. The versions were registered with `serialization_format="cloudpickle"`, as Register does, one of `logreg` and one of `xgboost`.
+
+Observed (2026-11-06), 12 checks, all passed:
+
+- **One version:** the outputs name version `1`, `model_dir` ends in `models/churn/v1`, `storage_uri` is `pvc://churn-data/models/churn/v1`, and the folder holds only `model.joblib`.
+- **Two versions, alias on 2 (an `xgboost` champion):** it writes `v2`, `v1` keeps the same SHA-256, and the only call to `mlflow.sklearn.load_model` was `models:/churn/2`, not `models:/churn@champion`.
+- **Same version twice:** the second run replaces the file (newer modification time) and the folder holds nothing but `model.joblib` (no `.tmp` left).
+- **No alias:** it raises a `RuntimeError` that names the alias and the model.
+- **No `processed/train.csv`:** it raises `FileNotFoundError` and does not pass in silence.
