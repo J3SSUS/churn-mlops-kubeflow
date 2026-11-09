@@ -640,3 +640,28 @@ All times are seconds after the `patch` (the clock of the script minus the momen
 - **The second run in KFP was not done, by decision of the user** (eight of the nine attempts failed with the same KFP flake, see above, and the patch path had already been exercised outside KFP). So the criterion "the second deploy run finishes `Succeeded` and keeps the same `uid`" is **not met as written**. What exists instead: the patch of `publish` against the real InferenceService ran nine times in a pod (three with the same spec, and six changing between v1 and v2), always with the same `uid` (`6519f4b2-2a3e-4286-a18c-4479f2075584`) and no recreation.
 - **Times.** The workflow of the first run (`churn-deploy-4cdmp`) took 9 min 22 s from the first submission to `Succeeded`, with three retries of the same run in between, so it says little about the cost of a clean run. Inside the cluster, from the logs of that run: the `fetch_champion` pod started at 03:02:52Z and logged `publish success` at 03:03:00Z (about 8 s), and a model change takes about 16 s from the patch to `publish` returning. A clean-run time was not measured.
 - **Hygiene.** The Error pods left by failed attempts were deleted. No pod is outside `Running` or `Completed`, no temporary pod or ConfigMap is left, and the node disk is at 91 % (5.2 GB free). The port-forwards to the KFP API (8888) and MLflow (5001) were still open at this point.
+
+## Monitoring (SPEC 08, E4.1 to E4.3)
+
+### E4.1 Serving metrics (measured 2026-11-07, no code needed)
+
+- `GET /metrics` on port 8080 of the predictor pod answers `200`.
+- It exposes the histograms `request_preprocess_seconds`, `request_predict_seconds`, `request_postprocess_seconds` and `request_explain_seconds`, all labelled `model_name="churn"`. The custom-predictor fallback of README §7 is not needed.
+- **There is no error metric.** No metric carries an HTTP status, so an error-rate panel cannot be built from the predictor. SPEC 09 decides how to cover it.
+- The container declares no named port and the pod annotations `prometheus.kserve.io/*` are not read (`enable-prometheus-scraping` is `"false"`). The scrape therefore goes through the Service `churn-predictor` (named port, 80 to 8080) with a `ServiceMonitor`.
+
+### Values file and dry render (step 1)
+
+```bash
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm repo update
+helm template monitoring prometheus-community/kube-prometheus-stack --version 92.22.0 \
+  -n monitoring -f k8s/monitoring-values.yaml > render.yaml
+```
+
+Result (Helm 4.3.1, no cluster needed): exit 0. The output has no Alertmanager, node-exporter or kube-state-metrics workloads. The `Prometheus` object has `retention: "24h"`, a 2Gi `volumeClaimTemplate` with class `standard` and empty `serviceMonitorSelector` / `podMonitorSelector` (the `*SelectorNilUsesHelmValues: false` effect). The Grafana Deployment has no `persistentVolumeClaim`.
+
+Gotchas:
+
+- The render still provisions a Grafana datasource named "Alertmanager" (it points at a service that does not exist) and keeps the operator RBAC for `alertmanagers`. Harmless; ignore the red datasource in Grafana.
+- `adminPassword` is not in the values. The only `admin-password` in the render is the `Secret` the chart generates (random on every render, and `helm template` output is not committed).
