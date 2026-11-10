@@ -747,3 +747,16 @@ Gotchas:
 - The Prometheus image has no `du` or `df`, so `kubectl exec ... du -sm /prometheus` fails. Use the metrics above.
 - The restarts counted (operator 7, Prometheus 3) are from the Grafana overload of step 2, they did not grow afterwards.
 - The disk went from 17 GB to 14 GB free after the install: the images of the stack plus the PVC.
+
+## Load generator, dashboard and submission (SPEC 09, E4.4 to E4.6)
+
+### Assumptions checked on the cluster (step 1, 2026-11-09)
+
+Checked with the helper pod `k8s/data-loader-pod.yaml` and a temporary pod with `churn-base:0.3.0` that mounted `churn-data` and `churn-code`; both pods were deleted afterwards.
+
+- **`test.csv` is at `/mnt/data/raw/test.csv`** (`RAW_DIR_PVC`): 10,001 lines, that is 10,000 rows plus the header, with every column of `FEATURES`. `sample_submission.csv` and `train.csv` are in the same folder.
+- **`/mnt/data/submission.csv` does not exist yet.** The directory `/mnt/data` is `drwxrwxrwx` and `churn-base` has no `USER` line, so the pods run as root and can write there.
+- **`pandas` 3.1.0 imports** in `churn-base:0.3.0`.
+- **The endpoint answers from a pod in `kubeflow`:** `POST http://churn-predictor.kubeflow.svc.cluster.local/v1/models/churn:predict` with the first row of `test.csv` (numbers as floats, strings as strings) returned `HTTP 200` and `{"predictions":[[0.7604308402435738,0.23956915975642623]]}`. No port-forward is needed from inside the cluster.
+- **That request counts in the predictor.** It raised `request_predict_seconds_count` by 1, so the baseline of the `+100` check of step 4 is taken right before the Job, not from this step.
+- Node before the step: load average 0.35, 2298 MB available, 14 GB free on `/var`.
