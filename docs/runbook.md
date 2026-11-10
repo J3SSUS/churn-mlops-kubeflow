@@ -665,3 +665,14 @@ Gotchas:
 
 - The render still provisions a Grafana datasource named "Alertmanager" (it points at a service that does not exist) and keeps the operator RBAC for `alertmanagers`. Harmless; ignore the red datasource in Grafana.
 - `adminPassword` is not in the values. The only `admin-password` in the render is the `Secret` the chart generates (random on every render, and `helm template` output is not committed).
+
+### Gates before the install (step 1, measured 2026-11-09 after `minikube start`)
+
+| Measure | Command | Before the install |
+|---|---|---|
+| Node memory | `minikube ssh -- free -m` | 7834 total, 4810 used, 3023 available |
+| Node disk | `minikube ssh -- df -h /var` | 59 GB, 39 GB used, 17 GB free (70 %) |
+
+Gates of the spec (at least 1.5 GB of available memory and 4 GB of free disk): both pass.
+
+Gotcha: the disk of minikube is the disk of the Docker VM. The minikube volume (about 28 GB, of which 25 GB is `/var/lib/containerd`) shares it with the host images and the build cache, so `df` inside minikube moves when the host is pruned. Right after `minikube start` the disk was at 91 % (5.2 GB free); `docker builder prune -f` on the host (4.5 GB of build cache) took it to 70 % (17 GB free). Memory right after a start is not representative: pods are still settling, so measure again a few minutes later.
