@@ -676,3 +676,28 @@ Gotchas:
 Gates of the spec (at least 1.5 GB of available memory and 4 GB of free disk): both pass.
 
 Gotcha: the disk of minikube is the disk of the Docker VM. The minikube volume (about 28 GB, of which 25 GB is `/var/lib/containerd`) shares it with the host images and the build cache, so `df` inside minikube moves when the host is pruned. Right after `minikube start` the disk was at 91 % (5.2 GB free); `docker builder prune -f` on the host (4.5 GB of build cache) took it to 70 % (17 GB free). Memory right after a start is not representative: pods are still settling, so measure again a few minutes later.
+
+### Install of the chart (step 2, 2026-11-09)
+
+Final command (chart 92.22.0, Helm 4.3.1):
+
+```bash
+helm upgrade --install monitoring prometheus-community/kube-prometheus-stack \
+  --version 92.22.0 -n monitoring --create-namespace \
+  -f k8s/monitoring-values.yaml --wait --timeout 10m
+```
+
+Result: release `monitoring` `deployed` (revision 2), 13 s on the last run. Pods `monitoring-kube-prometheus-operator` and `prometheus-monitoring-kube-prometheus-prometheus-0` are `Running` and ready, the PVC of Prometheus is `Bound` (2Gi), 10 CRDs of `monitoring.coreos.com`, no `OOMKilled`. Node after: 2634 MB available, 15 GB free on `/var` (74 %), load average 11.9.
+
+What happened before (stop rule of the spec, no blind retries):
+
+- **First install, Grafana inside the chart.** `--wait` failed after 10 min: `Deployment/monitoring-grafana not ready`. The container `grafana` (Grafana 13) never opened port 3000; the kubelet killed it by liveness (exit 137, not `OOMKilled`) and it restarted 3 times in 10 min.
+- **Second try, liveness `initialDelaySeconds: 300`.** Same result after 11 min 24 s, and now `helm` and `kubectl` timed out with `TLS handshake timeout`. Inside the node the load average was 254 on 12 CPUs (Grafana, the operator, the KServe controller and the API server at 25 to 46 % CPU each). Memory was not the cause (about 1.9 GB available).
+- **Decision:** Grafana runs outside the cluster, in a container on the Mac (`docker/grafana/compose.yaml`, SPEC 08 decision), and `grafana.enabled: false`.
+
+Gotchas:
+
+- **A failed Helm upgrade can leave the release in `pending-upgrade`.** The next `helm upgrade` then says `another operation (install/upgrade/rollback) is in progress`. The status lives in a Secret: `kubectl get secret -n monitoring -l owner=helm -L status` shows it, and `kubectl delete secret -n monitoring sh.helm.release.v1.monitoring.v<N>` for the `pending-upgrade` revision unlocks it. The release stays `failed` and the next upgrade works.
+- **`helm list` in Helm 4 has no `--all` flag.** Use `helm list -n monitoring` or `helm history monitoring -n monitoring`.
+- **Restarts during the incident are not a regression of the stack.** The operator shows 7 restarts and Prometheus 3, all during the minutes of overload caused by Grafana. The restart counts are checked again after the settle time of step 6.
+- Under load the API server answers `TLS handshake timeout` in bursts; a command that fails once can work 20 s later. Wait for `minikube ssh -- uptime` to drop below about 20 before changing anything.

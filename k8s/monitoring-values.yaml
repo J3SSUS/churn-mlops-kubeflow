@@ -36,11 +36,7 @@ prometheus:
           accessModes: [ReadWriteOnce]
           resources: {requests: {storage: 2Gi}}
 
-grafana:
-  enabled: true
-  defaultDashboardsEnabled: false
-  persistence: {enabled: false}
-  # No adminPassword here: the chart generates it into the Secret "monitoring-grafana".
-  resources:
-    requests: {cpu: 50m, memory: 128Mi}
-    limits: {memory: 320Mi}
+# Grafana is not installed in the cluster: on this node Grafana 13 took minutes to open its port,
+# the kubelet killed it in a loop and the load average reached 254 (SPEC 08, step 2).
+# It runs on the laptop (Homebrew) and reads Prometheus through a port-forward.
+grafana: {enabled: false}

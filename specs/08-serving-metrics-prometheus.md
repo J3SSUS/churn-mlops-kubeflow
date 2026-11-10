@@ -27,14 +27,14 @@ This spec ends when Prometheus shows the target UP and a query returns the reque
   - `k8s/monitoring-values.yaml` installs `kube-prometheus-stack` in the namespace `monitoring`, with the chart version pinned to one exact version.
   - Alertmanager, node-exporter and kube-state-metrics are off.
   - Prometheus keeps 24 h of data on a PVC of 2Gi (StorageClass `standard`), with a memory limit.
-  - Grafana is on, with a memory limit and no PVC. Its Prometheus datasource comes provisioned by the chart.
+  - Grafana is **not** installed in the cluster (`grafana.enabled: false`). It runs in a Docker container on the user's Mac (Docker Compose, `docker/grafana/compose.yaml`) and reads Prometheus through the port-forward `19090`. See the decision below: Grafana 13 starved the node in the cluster.
   - Prometheus is set to pick up `ServiceMonitor` objects that do not carry the release label.
   - Memory (`minikube ssh -- free -m`) and disk (`df -h /var`) are measured before and after the install and written in the runbook.
 - **E4.3 Scrape config:**
   - `k8s/servicemonitor-churn.yaml`, a `ServiceMonitor` for the Service `churn-predictor`, applied by hand.
   - The target shows UP in Prometheus.
   - A PromQL query on `request_predict_seconds_count{model_name="churn"}` returns a value, and one `:predict` request through a port-forward raises it by 1.
-  - Grafana opens through a port-forward and its Prometheus datasource tests healthy.
+  - Grafana on the Mac (`http://localhost:3000`) has a datasource of type `prometheus` pointing at `http://localhost:19090` whose health check answers `OK`.
 - **Docs:**
   - A "Monitoring" section in `docs/runbook.md` with the commands actually run, the E4.1 findings, the memory and disk numbers and the gotchas of Helm 4.
   - A dated line in the `DECISIONS.md` log for the chart version.
@@ -64,6 +64,7 @@ This spec adds no business data and no Python code. It defines the files, the va
 |---|---|
 | `k8s/monitoring-values.yaml` | Values for `kube-prometheus-stack` (below) |
 | `k8s/servicemonitor-churn.yaml` | The `ServiceMonitor` for the predictor (below) |
+| `docker/grafana/compose.yaml` | Grafana 13.3.0 in a container on the Mac, port 3000, named volume `grafana-data` (below) |
 
 `docs/runbook.md`, `DECISIONS.md`, `README.md` and `BACKLOG.md` change as listed in the scope.
 
@@ -113,18 +114,27 @@ prometheus:
           accessModes: [ReadWriteOnce]
           resources: {requests: {storage: 2Gi}}
 
-grafana:
-  enabled: true
-  defaultDashboardsEnabled: false
-  persistence: {enabled: false}
-  resources:
-    requests: {cpu: 50m, memory: 128Mi}
-    limits: {memory: 320Mi}
+grafana: {enabled: false}   # runs outside the cluster (container on the Mac), see Decisions
 ```
 
 - The default scrape targets of the cluster (API server, kubelet, control plane, CoreDNS) and the default rules are off. They would add many series and memory, and nothing in this project uses them. Prometheus still scrapes itself, which is enough to prove the stack works before the predictor target exists.
-- The Grafana password is **not** in the file. The chart generates it into the Secret `monitoring-grafana`, and the runbook gives the `kubectl get secret` command to read it. This differs from "password in the values" that was agreed in the conversation: the repo is a public portfolio, and a password in it looks bad even for a local cluster.
-- The datasource is provisioned by the chart (Prometheus at `monitoring-kube-prometheus-prometheus:9090`).
+- Grafana is not part of the release, so there is no Grafana password in the file, in a Secret or in the repo. The local Grafana asks for a new password at its first login.
+- The datasource of the local Grafana is created by hand (URL `http://host.docker.internal:19090`), because the chart no longer provisions it.
+
+### `docker/grafana/compose.yaml`
+
+```yaml
+services:
+  grafana:
+    image: grafana/grafana:13.3.0     # same version the user had with Homebrew
+    ports: ["3000:3000"]
+    volumes: [grafana-data:/var/lib/grafana]
+volumes:
+  grafana-data:
+```
+
+- The container reaches Prometheus through `host.docker.internal:19090`, where the port-forward listens. The port-forward must be open whenever Grafana is used.
+- Docker commands are run by the user. The first login asks for a new admin password, and it is not stored in the repo.
 
 ### `k8s/servicemonitor-churn.yaml`
 
@@ -155,10 +165,9 @@ spec:
 
 | Object | Namespace | Notes |
 |---|---|---|
-| Helm release `monitoring` | `monitoring` | Prometheus operator, Prometheus (1 pod), Grafana (1 pod with its sidecars) |
+| Helm release `monitoring` | `monitoring` | Prometheus operator and Prometheus (1 pod). No Grafana |
 | CRDs `monitoring.coreos.com` | cluster | Installed by the chart; they stay if the release is uninstalled |
 | PVC of Prometheus | `monitoring` | 2Gi, StorageClass `standard` (hostPath on the same node disk) |
-| Secret `monitoring-grafana` | `monitoring` | Holds the generated admin password |
 | `ServiceMonitor` `churn-predictor` | `monitoring` | Scrapes the Service `churn-predictor` in `kubeflow` |
 
 ### What Prometheus will hold for the predictor
@@ -176,7 +185,7 @@ Prometheus adds `job="churn-predictor"`, `namespace="kubeflow"`, `service`, `pod
 | Service | Command target | Local port |
 |---|---|---|
 | Prometheus | `svc/monitoring-kube-prometheus-prometheus` 9090 | `19090` |
-| Grafana | `svc/monitoring-grafana` 80 | `13000` |
+| Grafana (outside the cluster) | `docker compose up -d`, `http://localhost:3000` | `3000` |
 
 ### Measurements recorded in the runbook
 
@@ -194,7 +203,7 @@ Prometheus adds `job="churn-predictor"`, `namespace="kubeflow"`, `service`, `pod
      - It renders with exit 0.
      - The output has no Alertmanager, node-exporter or kube-state-metrics objects.
      - The `Prometheus` object has `retention: 24h`, a 2Gi `volumeClaimTemplate` with the class `standard`, and both `*SelectorNilUsesHelmValues` flags false.
-     - The Grafana Deployment has no `persistentVolumeClaim` and the output has no `adminPassword` in clear text.
+     - The output has no Grafana object (no Deployment, no Secret `monitoring-grafana`).
    - Check the gates before touching the cluster, with `minikube ssh -- free -m` and `df -h /var`: at least 1.5 GB of available memory and 4 GB of free disk. If the disk is below that, stop and ask the user to free space (for example `docker builder prune`, which is a Docker command and runs on the user's side).
 
 2. **Install the chart.**
@@ -206,12 +215,12 @@ Prometheus adds `job="churn-predictor"`, `namespace="kubeflow"`, `service`, `pod
      - No pod was `OOMKilled` and none has restarted. `minikube ssh -- free -m` still shows at least 400 MB available.
    - **Stop rule:** if a pod is `Pending`, `OOMKilled` or in a restart loop, or the node starts to thrash (API server timeouts), save `kubectl describe` and the pod logs as evidence, do not retry the install and do not chain restarts, and bring the options to the user (lower limits, raise the node memory, free disk).
 
-3. **Prometheus and Grafana answer (self-scrape only).**
-   - Open `kubectl port-forward -n monitoring svc/monitoring-kube-prometheus-prometheus 19090:9090` and `kubectl port-forward -n monitoring svc/monitoring-grafana 13000:80`, each in the background. Read the Grafana password with `kubectl get secret -n monitoring monitoring-grafana -o jsonpath='{.data.admin-password}' | base64 -d`.
+3. **Prometheus answers, and Grafana on the Mac reads it (self-scrape only).**
+   - Open `kubectl port-forward -n monitoring svc/monitoring-kube-prometheus-prometheus 19090:9090` in the background.
    - Check:
      - `curl http://localhost:19090/-/ready` answers 200, and the query `up{job="monitoring-kube-prometheus-prometheus"}` returns `1`.
-     - `curl http://localhost:13000/api/health` answers `"database": "ok"`.
-     - A request to Grafana with the admin user and the password from the Secret lists a datasource of type `prometheus`, and its health endpoint answers `OK`.
+     - `curl http://localhost:3000/api/health` answers `"database": "ok"` (Grafana started with `docker compose -f docker/grafana/compose.yaml up -d`).
+     - Grafana, running from `docker/grafana/compose.yaml`, accepts a datasource of type `prometheus` with URL `http://host.docker.internal:19090` (the port-forward seen from the container), and its health check answers `OK`.
 
 4. **Scrape the predictor (E4.3).**
    - Write `k8s/servicemonitor-churn.yaml` as in the data model and apply it.
@@ -232,8 +241,8 @@ Prometheus adds `job="churn-predictor"`, `namespace="kubeflow"`, `service`, `pod
    - Check: no pod restarted, available memory is at least 400 MB, free disk is at least 2 GB, and the PVC of Prometheus uses less than 500 MB (`du` inside the pod, or the `prometheus_tsdb_storage_blocks_bytes` metric).
 
 7. **Docs and hygiene.**
-   - Write the "Monitoring" section of `docs/runbook.md`: the commands actually run, the E4.1 findings, the memory and disk numbers before and after, the Grafana password command, how to reopen the port-forwards, and the gotchas of Helm 4.
-   - Add the `DECISIONS.md` log line (chart 92.22.0, Helm 4.3.1, disabled targets, generated Grafana password).
+   - Write the "Monitoring" section of `docs/runbook.md`: the commands actually run, the E4.1 findings, the memory and disk numbers before and after, the Compose commands for Grafana, how to reopen the port-forwards, and the gotchas of Helm 4.
+   - Add the `DECISIONS.md` log line (chart 92.22.0, Helm 4.3.1, disabled targets, Grafana outside the cluster).
    - Update the README: Prometheus and Grafana rows marked as installed, the risk "Metrics from KServe sklearn server" in §7 marked as solved, and the "Cluster memory" risk with the measured numbers.
    - Tick E4.1 to E4.3 in `BACKLOG.md`.
    - Check: every command in the runbook section appears in the steps above, `grep -rniE 'adminPassword|admin-password' k8s/ docs/ README.md` finds no password value, and the port-forwards are closed.
@@ -244,7 +253,7 @@ Prometheus adds `job="churn-predictor"`, `namespace="kubeflow"`, `service`, `pod
 - [ ] `k8s/monitoring-values.yaml` exists, and `helm template monitoring prometheus-community/kube-prometheus-stack --version 92.22.0 -n monitoring -f k8s/monitoring-values.yaml` exits 0.
 - [ ] The rendered output has no object of Alertmanager, node-exporter or kube-state-metrics.
 - [ ] The rendered `Prometheus` object has `retention: 24h`, a `volumeClaimTemplate` of 2Gi with the class `standard`, and `serviceMonitorSelectorNilUsesHelmValues` and `podMonitorSelectorNilUsesHelmValues` false.
-- [ ] The rendered Grafana Deployment has no `persistentVolumeClaim`.
+- [ ] The rendered output has no Grafana object.
 - [ ] Before the install, the node had at least 1.5 GB of available memory and 4 GB of free disk, and both numbers are in the runbook.
 
 ### E4.1 findings
@@ -259,8 +268,8 @@ Prometheus adds `job="churn-predictor"`, `namespace="kubeflow"`, `service`, `pod
 
 ### Prometheus and Grafana
 - [ ] `curl http://localhost:19090/-/ready` answers 200, and the query `up{job="monitoring-kube-prometheus-prometheus"}` returns `1`.
-- [ ] `curl http://localhost:13000/api/health` answers with `"database": "ok"`.
-- [ ] Grafana, with the admin user and the password read from the Secret `monitoring-grafana`, lists a datasource of type `prometheus` whose health check answers `OK`.
+- [ ] `curl http://localhost:3000/api/health` answers with `"database": "ok"` (Grafana on the Mac).
+- [ ] Grafana has a datasource of type `prometheus` with URL `http://localhost:19090` whose health check answers `OK`.
 
 ### Scrape of the predictor
 - [ ] `k8s/servicemonitor-churn.yaml` exists, and `kubectl get servicemonitor -n monitoring churn-predictor` finds it.
@@ -281,7 +290,7 @@ Prometheus adds `job="churn-predictor"`, `namespace="kubeflow"`, `service`, `pod
 - [ ] `git diff main -- components/tuning_config.json` is empty, and `git ls-files | grep -c '\.csv$'` returns 0.
 
 ### Docs and hygiene
-- [ ] `docs/runbook.md` has a "Monitoring" section with the commands run, the memory and disk numbers before and after, the command that reads the Grafana password, how to reopen the port-forwards, and the gotchas of Helm 4.
+- [ ] `docs/runbook.md` has a "Monitoring" section with the commands run, the memory and disk numbers before and after, the Compose commands for Grafana, how to reopen the port-forwards, and the gotchas of Helm 4.
 - [ ] `grep -rniE 'adminPassword|admin-password' k8s/ docs/ README.md` finds no password value.
 - [ ] The README rows of Prometheus and Grafana say installed, §7 says the risk "Metrics from KServe sklearn server" is solved, and the "Cluster memory" risk carries the measured numbers.
 - [ ] `BACKLOG.md` has E4.1 to E4.3 ticked.
@@ -309,14 +318,14 @@ Prometheus adds `job="churn-predictor"`, `namespace="kubeflow"`, `service`, `pod
 - **Yes:** Prometheus keeps 24 h of data on a PVC of 2Gi (StorageClass `standard`). The user asked for persistence. 24 h and one series set are far below 2Gi, and the disk is at 91 %.
 - **No:** `emptyDir` for Prometheus. It was the first recommendation, and the user chose the PVC so a restart does not lose the data.
 - **No:** a bigger PVC or a longer retention. The disk has 5.2 GB free, and nothing in the project needs history.
-- **Yes:** Grafana without a PVC, with the dashboard of SPEC 09 in a ConfigMap. A restart then loses nothing that matters.
-- **No:** a PVC for Grafana. It would take disk for state that lives in the repo.
-- **Yes:** the Grafana admin password is generated by the chart into the Secret `monitoring-grafana`, and the runbook gives the command to read it. This differs from "password in the values" agreed in the conversation, and the reason is that the repo is a public portfolio.
+- **Yes:** Grafana runs outside the cluster, in a Docker container on the user's Mac (Docker Compose, so nothing is installed on the laptop and the state lives in a named volume), and reads Prometheus through the port-forward `19090`. In the cluster, Grafana 13 took minutes to open its port, the kubelet killed it in a loop (7 restarts in 52 min, also after a longer liveness delay of 300 s) and the node reached a load average of 254 on 12 CPUs, with the API server timing out on 2026-11-09. Memory was not the cause (about 1.9 GB available, no `OOMKilled`).
+- **No:** installing Grafana in the cluster with a separate chart or a `startupProbe`. It would not fix the cost of its start on this node. The price of the decision is a step outside the cluster and a datasource created by hand (URL `http://host.docker.internal:19090`).
+- **Yes:** no Grafana password is stored anywhere in the repo. The local Grafana asks for a new one at its first login.
 - **No:** a password in `k8s/monitoring-values.yaml`. Even for a local cluster, it looks bad in a public repo and a `grep` check cannot tell a fake from a real one.
 - **Yes:** `serviceMonitorSelectorNilUsesHelmValues: false` (and the same for pod monitors). Without it, Prometheus only picks up objects with the label of the Helm release, and the `ServiceMonitor` would be ignored without any error.
 - **No:** adding the release label to the `ServiceMonitor`. It couples a file in the repo to the name of a Helm release.
 - **Yes:** the Helm release is called `monitoring` and lives in the namespace `monitoring`, as README §4 already says. The Service names are then predictable (`monitoring-grafana`, `monitoring-kube-prometheus-prometheus`).
-- **Yes:** the port-forwards use local ports 19090 (Prometheus) and 13000 (Grafana), and 18080 for the predictor. Port 8080 belongs to the KFP UI, as the spike found.
+- **Yes:** the port-forwards use local ports 19090 (Prometheus) and 3000 (Grafana, local), and 18080 for the predictor. Port 8080 belongs to the KFP UI, as the spike found.
 - **Yes:** memory and disk gates before the install (1.5 GB and 4 GB) and after it (400 MB and 2 GB). The numbers come from the measurement of 2026-11-07, and a heavy install once left this node thrashing (SPEC 03).
 - **No:** installing first and looking at the memory afterwards. A thrashing node makes the API server time out and hides the cause.
 - **Yes:** a stop rule for the install: if a pod is `Pending`, `OOMKilled` or restarting, save the evidence and bring the options to the user. No retry and no chained restarts.
@@ -343,7 +352,7 @@ Prometheus adds `job="churn-predictor"`, `namespace="kubeflow"`, `service`, `pod
 | Helm 4 behaves differently from what the documentation of the chart assumes: `--wait`, `--atomic`, the server-side apply default or the output format. The first install fails or hangs in an unclear state. | The command of step 2 is run once and recorded with its output. If it fails, the release state (`helm list -n monitoring -a`) and the events are saved, and the options go to the user before any `helm uninstall` or retry. Gotchas go in the runbook. |
 | The chart's CRDs and the admission webhook cause trouble: a half-installed release leaves CRDs behind, and a later install fails on webhook certificates or on stale objects. | The CRDs are cluster-level and Helm does not remove them on uninstall, and the runbook says so. If an install fails halfway, the state is inspected first. The CRDs are not deleted inside this spec without a decision from the user. |
 | The Prometheus PVC uses the StorageClass `standard` (hostPath, reclaim policy `Delete`) on the same node disk. If the PVC is deleted or the node is recreated, the data is lost. | The data is only 24 h of a learning project, and the user accepted the PVC for restarts, not for durability. The runbook says the PVC does not survive `minikube delete`. |
-| The Grafana password is lost or leaks. It is generated into the Secret, so there is no copy in the repo, but the Secret can be deleted with the namespace. | The runbook gives the `kubectl get secret` command to read it. A new release creates a new Secret. The final `grep` of the criteria checks that no password value is in `k8s/`, `docs/` or the README. |
+| The Grafana password leaks. | Grafana is local and not in the repo. The final `grep` of the criteria still checks that no password value is in `k8s/`, `docs/` or the README. |
 | A port-forward is left running and holds a local port, or one collides with the KFP UI on 8080. | The plan uses only 19090, 13000 and 18080. The last criterion checks that no port-forward of this spec is still running. |
 | KFP runs fail in their first minutes (the drivers time out against `metadata-grpc`; the cause was never found) while the new stack uses the node's memory and CPU. The flake could be blamed on, or made worse by, the stack. | This spec does not run any pipeline. If a later run fails with `dial tcp ... i/o timeout`, the stack is checked against the runbook measurements first. The criteria require the same `uid` and `resourceVersion` for the InferenceService, so nothing in Pipeline 2 changes. |
 
