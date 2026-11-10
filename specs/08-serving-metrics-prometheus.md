@@ -32,6 +32,7 @@ This spec ends when Prometheus shows the target UP and a query returns the reque
   - Memory (`minikube ssh -- free -m`) and disk (`df -h /var`) are measured before and after the install and written in the runbook.
 - **E4.3 Scrape config:**
   - `k8s/servicemonitor-churn.yaml`, a `ServiceMonitor` for the Service `churn-predictor`, applied by hand.
+  - `k8s/networkpolicy-allow-monitoring.yaml`, a `NetworkPolicy` in `kubeflow` that lets the namespace `monitoring` reach the predictor on port 8080, applied by hand. Without it the scrape times out (the namespace has `default-allow-same-namespace`, which only accepts ingress from the same namespace).
   - The target shows UP in Prometheus.
   - A PromQL query on `request_predict_seconds_count{model_name="churn"}` returns a value, and one `:predict` request through a port-forward raises it by 1.
   - Grafana on the Mac (`http://localhost:3000`) has a datasource of type `prometheus` pointing at `http://localhost:19090` whose health check answers `OK`.
@@ -64,6 +65,7 @@ This spec adds no business data and no Python code. It defines the files, the va
 |---|---|
 | `k8s/monitoring-values.yaml` | Values for `kube-prometheus-stack` (below) |
 | `k8s/servicemonitor-churn.yaml` | The `ServiceMonitor` for the predictor (below) |
+| `k8s/networkpolicy-allow-monitoring.yaml` | The `NetworkPolicy` that lets Prometheus scrape the predictor (below) |
 | `docker/grafana/compose.yaml` | Grafana 13.3.0 in a container on the Mac, port 3000, named volume `grafana-data` (below) |
 
 `docs/runbook.md`, `DECISIONS.md`, `README.md` and `BACKLOG.md` change as listed in the scope.
@@ -161,6 +163,32 @@ spec:
 - The object lives in `monitoring` and points at `kubeflow` with `namespaceSelector`, so everything that belongs to monitoring is removed together.
 - It is applied by hand and no component of Pipeline 2 creates it.
 
+### `k8s/networkpolicy-allow-monitoring.yaml`
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-monitoring-scrape
+  namespace: kubeflow
+spec:
+  podSelector:
+    matchLabels:
+      serving.kserve.io/inferenceservice: churn
+      component: predictor
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - {protocol: TCP, port: 8080}
+```
+
+- Found on 2026-11-09 in step 4: the target was `down` with `context deadline exceeded` while `/metrics` answered in 38 ms through a port-forward. The cause is the pre-existing `NetworkPolicy` `default-allow-same-namespace` in `kubeflow` (`podSelector: {}`, ingress only from `podSelector: {}`), enforced by kindnet.
+- NetworkPolicies add up, so this object only opens port 8080 of the predictor pods to the namespace `monitoring`. The existing policy is not touched, and neither are the Service or the InferenceService.
+
 ### Cluster objects
 
 | Object | Namespace | Notes |
@@ -223,9 +251,9 @@ Prometheus adds `job="churn-predictor"`, `namespace="kubeflow"`, `service`, `pod
      - Grafana, running from `docker/grafana/compose.yaml`, accepts a datasource of type `prometheus` with URL `http://host.docker.internal:19090` (the port-forward seen from the container), and its health check answers `OK`.
 
 4. **Scrape the predictor (E4.3).**
-   - Write `k8s/servicemonitor-churn.yaml` as in the data model and apply it.
+   - Write `k8s/servicemonitor-churn.yaml` and `k8s/networkpolicy-allow-monitoring.yaml` as in the data model and apply both. (The first apply of the `ServiceMonitor` alone left the target `down`; the `NetworkPolicy` was added by decision of the user.)
    - Check:
-     - `kubectl get servicemonitor -n monitoring churn-predictor` exists.
+     - `kubectl get servicemonitor -n monitoring churn-predictor` and `kubectl get networkpolicy -n kubeflow allow-monitoring-scrape` exist.
      - Within 2 minutes, `GET /api/v1/targets` on Prometheus lists a target with `job="churn-predictor"`, `namespace="kubeflow"` and `health="up"`.
    - If the target is missing or `down`, compare the labels of the `ServiceMonitor` with those of the Service and check the port name, then stop and bring the output to the user. Do not edit the Service or the InferenceService to make it fit.
 
@@ -273,6 +301,7 @@ Prometheus adds `job="churn-predictor"`, `namespace="kubeflow"`, `service`, `pod
 
 ### Scrape of the predictor
 - [ ] `k8s/servicemonitor-churn.yaml` exists, and `kubectl get servicemonitor -n monitoring churn-predictor` finds it.
+- [ ] `k8s/networkpolicy-allow-monitoring.yaml` exists, and `kubectl get networkpolicy -n kubeflow allow-monitoring-scrape` finds it. `default-allow-same-namespace` is unchanged.
 - [ ] Within 2 minutes of applying it, `GET /api/v1/targets` on Prometheus lists a target with `job="churn-predictor"`, `namespace="kubeflow"` and `health="up"`.
 - [ ] The query `request_predict_seconds_count{model_name="churn"}` returns one series with `job="churn-predictor"`.
 - [ ] After one `:predict` request through `svc/churn-predictor` (local port 18080, not 8080) and a wait of 30 s, that value is exactly 1 higher.
@@ -339,6 +368,8 @@ Prometheus adds `job="churn-predictor"`, `namespace="kubeflow"`, `service`, `pod
 - **No:** a cleanup script for the stack. The project does not need a teardown path, and the CRDs are shared cluster state.
 - **Yes:** Docker cleanup stays with the user. If the disk gate fails, the user runs `docker builder prune` or whichever command fits, because Docker commands are run by the user (`CLAUDE.md`).
 - **No:** a change to the frozen contracts. The `FEATURES` order, the registry names and the scikit-learn version are not touched, and the only new line of `DECISIONS.md` is the chart version.
+- **Yes:** a `NetworkPolicy` `allow-monitoring-scrape` in `kubeflow`, from the namespace `monitoring` to the predictor pods on TCP 8080. The pre-existing `default-allow-same-namespace` dropped the scrape, and the user approved this option on 2026-11-09.
+- **No:** moving Prometheus to `kubeflow` (it mixes monitoring with Kubeflow and breaks the design of this spec), and deleting `default-allow-same-namespace` (it loosens the whole namespace).
 
 ## Risks
 

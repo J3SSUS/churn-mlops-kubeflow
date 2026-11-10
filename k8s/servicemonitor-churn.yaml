@@ -1,0 +1,18 @@
+# ServiceMonitor for the churn predictor (SPEC 08, E4.3). Applied by hand:
+#   kubectl apply -f k8s/servicemonitor-churn.yaml
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: churn-predictor
+  namespace: monitoring
+spec:
+  namespaceSelector:
+    matchNames: [kubeflow]
+  selector:
+    matchLabels:
+      serving.kserve.io/inferenceservice: churn
+      component: predictor
+  endpoints:
+    - port: churn-predictor      # the named port of the Service (80 -> 8080)
+      path: /metrics
+      interval: 15s

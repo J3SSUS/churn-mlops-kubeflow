@@ -1,0 +1,22 @@
+# Lets Prometheus (namespace "monitoring") scrape the churn predictor (SPEC 08, E4.3).
+# The namespace "kubeflow" has default-allow-same-namespace, which drops ingress from other
+# namespaces. NetworkPolicies add up, so this only opens TCP 8080 of the predictor pods.
+# Applied by hand: kubectl apply -f k8s/networkpolicy-allow-monitoring.yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-monitoring-scrape
+  namespace: kubeflow
+spec:
+  podSelector:
+    matchLabels:
+      serving.kserve.io/inferenceservice: churn
+      component: predictor
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - {protocol: TCP, port: 8080}

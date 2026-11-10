@@ -715,3 +715,15 @@ curl -s http://localhost:3000/api/health                                        
 Grafana datasource (created by hand in the UI, Connections, Data sources, Prometheus): URL `http://host.docker.internal:19090`. Save & test answers "Successfully queried the Prometheus API". The first login (`admin` / `admin`) asks for a new password, which is not stored anywhere in the repo.
 
 To reopen after a restart: start minikube, wait for `minikube ssh -- uptime` to drop below about 20, reopen the port-forward above, then `docker compose -f docker/grafana/compose.yaml up -d`. The datasource persists in the volume `grafana-data`; Grafana only shows data while the port-forward is open.
+
+### Scrape of the predictor (step 4, 2026-11-09)
+
+```bash
+kubectl apply -f k8s/servicemonitor-churn.yaml
+kubectl apply -f k8s/networkpolicy-allow-monitoring.yaml
+# Prometheus: GET /api/v1/targets -> job="churn-predictor", namespace="kubeflow", health="up"
+```
+
+The `ServiceMonitor` alone left the target `down` (`Get "http://10.244.0.30:8080/metrics": context deadline exceeded`, scrape timeout of 10 s) even though the labels and the port name matched and `/metrics` answered in 38 ms through a port-forward.
+
+Gotcha: **the namespace `kubeflow` has a `NetworkPolicy` `default-allow-same-namespace`** (`podSelector: {}`, ingress only from the same namespace), enforced by kindnet. A pod in another namespace, like Prometheus in `monitoring`, is dropped silently: no error, only a timeout. `k8s/networkpolicy-allow-monitoring.yaml` adds a second policy that opens TCP 8080 of the predictor pods (`component=predictor`) to the namespace `monitoring`. Policies add up, so the existing one is untouched. After applying it the target was `up` on the first check. To diagnose this again: compare the time of `/metrics` through a port-forward (it goes through the node, not the pod network) with the scrape error, and run `kubectl get networkpolicy -A`.
