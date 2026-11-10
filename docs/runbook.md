@@ -1,6 +1,155 @@
 # Runbook — Bank Customer Churn MLOps
 
-Commands actually run, in order. Sections are added as each spec is implemented.
+Commands actually run, in order. The two sections right below are the short path and the gotchas by symptom; the sections after them are the detail, one per spec, with the measurements and the reasons.
+
+## From `minikube start` to Grafana (the short path)
+
+The commands below are the ones that worked, in the order to run them. Each step says what to check, and points to the section with the measurements and the reasons. Terminals: steps 6 and 10 need long-lived port-forwards, so keep one terminal per forward (a `kubectl port-forward` started with `!` inside Claude Code blocks the session).
+
+Not covered here: installing Kubeflow Pipelines 2.15.0, KServe 0.21.0 and cert-manager (they were installed before this project), and Helm 4.3.1 / `uv` / Docker Desktop (about 8 GB for its VM).
+
+**1. Start the cluster and wait until it is quiet** (section "Cluster")
+
+```bash
+minikube start
+minikube ssh -- 'uptime; free -m | sed -n 2p; df -h /var | tail -1'       # 1-minute load below 20, at least 1 GB available, at least 4 GB free
+kubectl get pods -A --no-headers | awk '$4!="Running" && $4!="Completed"'   # prints nothing; after a start, wait a few minutes
+```
+
+**2. Python environment** (section "Python environment")
+
+```bash
+uv sync
+```
+
+**3. Data PVC, once** (section "Data PVC"): `data/train.csv`, `test.csv` and `sample_submission.csv` must exist locally.
+
+```bash
+kubectl apply -f k8s/pvc-churn-data.yaml -f k8s/data-loader-pod.yaml
+kubectl wait --for=condition=Ready pod/data-loader -n kubeflow --timeout=120s
+kubectl exec -n kubeflow data-loader -- mkdir -p /mnt/data/raw
+for f in train test sample_submission; do kubectl cp data/$f.csv kubeflow/data-loader:/mnt/data/raw/$f.csv; done
+kubectl delete pod data-loader -n kubeflow                                   # the PVC stays
+```
+
+**4. Images, once** (sections "`churn-base` image" and "Derived serving image"). They are built inside minikube, so they do not show in `docker images`.
+
+```bash
+minikube image build -t churn-base:0.3.0 docker/churn-base
+minikube image build -t churn-sklearnserver:0.1.0 docker/churn-sklearnserver
+minikube image ls | grep -E 'churn-base|churn-sklearnserver'
+```
+
+**5. MLflow, RBAC and the serving runtime, once** (sections "MLflow", "Deploy pipeline")
+
+```bash
+kubectl apply -f k8s/mlflow.yaml && kubectl wait --for=condition=Available deploy/mlflow -n mlflow --timeout=300s
+kubectl apply -f k8s/rbac-pipeline-runner.yaml
+kubectl apply -f k8s/serving-runtime.yaml
+```
+
+**6. Port-forwards, one terminal each**
+
+```bash
+kubectl port-forward -n kubeflow svc/ml-pipeline 8888:8888          # KFP API, used by tools/submit_pipeline.py
+kubectl port-forward -n kubeflow svc/ml-pipeline-ui 8080:80         # KFP UI at http://localhost:8080
+kubectl port-forward -n mlflow svc/mlflow 5001:5000                 # MLflow UI at http://localhost:5001 (5000 is AirPlay on macOS)
+```
+
+**7. Pipeline 1, training** (sections "Config-driven tuning and evaluation", "Gate and Register"). Set `"n_trials": 3` in `components/tuning_config.json` first and put 30 back before committing: a 3-trial run takes about 5 minutes, while 30 trials overloaded this node (see "Attempted run with 30 trials").
+
+```bash
+uv run python tools/submit_pipeline.py                  # syncs the ConfigMap churn-code, compiles and submits; no --wait
+kubectl get workflow -n kubeflow                        # follow the phase; Succeeded is the goal
+```
+
+Check in MLflow (`http://localhost:5001`, experiment `churn-training`): one parent run per family, the `dummy` run, `tags.winner = "true"`, and the model `churn` with the alias `champion`. If a KFP pod fails with `GetContextByTypeAndName ... Unavailable` or `dial tcp ...:8080: i/o timeout`, it is the KFP flake: retry the **same run** (finished steps are kept) with the snippet in "Gotchas by symptom".
+
+**8. Pipeline 2, deploy** (section "Deploy pipeline")
+
+```bash
+uv run python tools/submit_pipeline.py --pipeline deploy
+kubectl get isvc churn -n kubeflow                                    # READY=True
+kubectl port-forward -n kubeflow svc/churn-predictor 18080:80         # never 8080, the KFP UI holds it
+# POST {"instances": [[675.0, "France", "Female", 37.0, 5.0, 0.0, 1.0, 1.0, 0.0, 131778.57]]} to http://localhost:18080/v1/models/churn:predict
+```
+
+**9. Prometheus** (section "Monitoring"). Check the node first: load below 20 and at least 1 GB available.
+
+```bash
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts && helm repo update
+helm upgrade --install monitoring prometheus-community/kube-prometheus-stack --version 92.22.0 \
+  -n monitoring --create-namespace -f k8s/monitoring-values.yaml --wait --timeout 10m
+kubectl apply -f k8s/servicemonitor-churn.yaml -f k8s/networkpolicy-allow-monitoring.yaml -f k8s/load-generator-podmonitor.yaml
+kubectl port-forward -n monitoring svc/monitoring-kube-prometheus-prometheus 19090:9090      # Prometheus at http://localhost:19090
+```
+
+Check: `http://localhost:19090/targets` lists `churn-predictor` as `UP` within 2 minutes. Wait about a minute after creating the `PodMonitor` before the first generator Job (see "Prometheus scrapes the generator").
+
+**10. Grafana, in a container on the laptop** (sections "Monitoring" and "Dashboard and provisioning"). It does not run in the cluster: it overloaded the node there.
+
+```bash
+docker compose -f docker/grafana/compose.yaml up -d        # needs the port-forward 19090 open
+# http://localhost:3000 : first login admin / admin asks for a new password; folder "Churn", dashboard "Churn serving"
+```
+
+**11. Load generator and submission** (sections "Load generator, dashboard and submission")
+
+```bash
+tools/sync_code.sh                                          # refreshes churn-code (config.py)
+kubectl create configmap load-generator -n kubeflow --from-file=load_generator.py=tools/load_generator.py \
+  --dry-run=client -o yaml | kubectl apply -f -
+kubectl delete job -n kubeflow load-generator --ignore-not-found       # a Job cannot be re-run
+sed 's|__ARGS__||' k8s/load-generator-job.yaml | kubectl apply -f -   # defaults: 5 passes, about 5 minutes; watch the dashboard
+kubectl wait --for=condition=complete job/load-generator -n kubeflow --timeout=900s
+kubectl apply -f k8s/data-loader-pod.yaml && kubectl wait --for=condition=Ready pod/data-loader -n kubeflow --timeout=90s
+kubectl cp kubeflow/data-loader:/mnt/data/submission.csv data/submission.csv      # data/ is git-ignored
+kubectl delete pod data-loader -n kubeflow
+uv run python tools/check_submission.py data/submission.csv           # RESULT ok: 10000 rows, ...
+```
+
+Uploading `data/submission.csv` to Kaggle is done by hand on the competition page (or with the Kaggle CLI).
+
+**12. Stop**
+
+```bash
+# close the port-forwards (Ctrl+C in each terminal), then:
+docker compose -f docker/grafana/compose.yaml stop
+minikube stop                                               # the PVCs survive a stop; minikube delete loses them
+```
+
+## Gotchas by symptom
+
+| Symptom | Cause | What to do | Where |
+|---|---|---|---|
+| `minikube status` says "failed to connect to the docker API" and `kubectl` has no current context | Docker Desktop is closed | Open Docker Desktop, then `minikube start` | "Cluster" |
+| `kubectl` and `minikube` time out (`TLS handshake timeout`), load average above 60 | The node is overloaded (MLflow with its default workers, Grafana inside the cluster, or the 30-trial run) | Do not retry or restart in a chain. Look at what eats the CPU with `minikube ssh -- ps -eo pid,pcpu,args --sort=-pcpu \| head`, remove the cause, wait for the load to fall below 20 | "MLflow", "Install of the chart", "Attempted run with 30 trials" |
+| A KFP step fails with `GetContextByTypeAndName ... Unavailable` or `dial tcp <metadata-grpc>:8080: i/o timeout`, before any of our code ran | The KFP flake (cause unknown). Only `*-driver` pods fail this way; a failed `executor` is a real error | Retry the same run (snippet below). Finished steps are kept | "Deploy runs on the cluster", "Gate and Register" |
+| `client.wait_for_run_completion` answers 500 (`lookup mysql`), or `--wait` gives up after 15 minutes | The KFP API is flaky and 15 minutes is a fixed limit | Submit without `--wait` and follow `kubectl get workflow -n kubeflow` | "Gate and Register" |
+| Failed runs leave pods in `Error` | Argo keeps them | `kubectl get pods -n kubeflow --no-headers \| awk '$3=="Error"{print $1}' \| xargs kubectl delete pod -n kubeflow` | "Deploy runs on the cluster" |
+| A port-forward stops answering | It dies when its pod is replaced (any `kubectl apply` that changes the Deployment) | Start it again | "MLflow" |
+| `curl` with `?` fails in zsh | The `?` is taken as a glob | Quote the URL | "MLflow" |
+| Prometheus shows the predictor target `down` with `context deadline exceeded`, while `/metrics` answers through a port-forward | The `NetworkPolicy` `default-allow-same-namespace` of `kubeflow` drops traffic from other namespaces | Apply `k8s/networkpolicy-allow-monitoring.yaml` | "Scrape of the predictor" |
+| `helm upgrade` says `another operation is in progress` | A failed upgrade left the release in `pending-upgrade` | `kubectl get secret -n monitoring -l owner=helm -L status`, delete the Secret of the `pending-upgrade` revision, upgrade again | "Install of the chart" |
+| The dashboard panels are empty | The predictor series exist only after its first request, `rate()` needs two samples, and the error panel needs a running generator Job | Run the generator Job and look at the dashboard while it runs | "Dashboard and provisioning" |
+| Grafana shows no data | The datasource goes through the port-forward `19090`, which dies with `minikube stop` | Open `kubectl port-forward -n monitoring svc/monitoring-kube-prometheus-prometheus 19090:9090` again | "Dashboard and provisioning" |
+| Two `level=error` lines about `provisioning/plugins` and `provisioning/alerting` in the Grafana logs | The mount replaces Grafana's default provisioning folder | Nothing, they are harmless | "Dashboard and provisioning" |
+| A Job or a pod keeps running the old code | Pods are immutable and ConfigMaps are copies | After editing a script, recreate its ConfigMap (`tools/sync_code.sh` for `config.py` and friends) and delete and re-create the pod or the Job | "MLflow", "Generator on the cluster" |
+| A pod keeps using an old image | Pods use `IfNotPresent`, so a reused tag keeps the stale image | Build with a new tag | "`churn-base` image" |
+| The disk is almost full (91 %) | minikube's disk is the disk of the Docker VM, shared with host images and the build cache | `docker builder prune -f` on the host frees space inside minikube too | "Gates before the install" |
+| `minikube delete` and the data is gone | The PVCs use minikube's hostpath provisioner | Reload the CSVs (step 3) and run Pipeline 1 again | "Data PVC", "MLflow" |
+| Request counters of the predictor are missing or low | The series starts at its first request, and a Job's last seconds are never scraped | Expected; look at the run, not at totals | "Prometheus scrapes the generator" |
+| `RESULT ok` on a submission that has `0.5` everywhere | `check_submission.py` checks format, ids and range, not quality | The order of answers is proven by the local test of the generator; the quality is the score on Kaggle | "Submission check, local" |
+| `$PIPESTATUS`, word splitting or `[0]` in `-o custom-columns=` fail in zsh | zsh differences | Use `${pipestatus[@]}`, arrays, and quote the column expression | observed in earlier sessions, not detailed in a section |
+
+Retry the same KFP run after a flake of a driver (the run id is in the UI and in the output of `submit_pipeline.py`):
+
+```bash
+uv run python - <<'PY'
+from kfp import Client
+Client(host="http://localhost:8888")._run_api.run_service_retry_run(run_id="<run id>")
+PY
+```
 
 ## Cluster (SPEC 01, E0.1)
 
@@ -915,3 +1064,38 @@ The four panels, measured with the same PromQL as the dashboard every 20 s durin
 After the run: no new restart in `monitoring` (still 7 and 3), load average 0.49, 2294 MB available. The screenshot is `docs/img/grafana-churn-serving.png`.
 
 Note: the rate stays under the 2 requests per second of the target (the criterion of the spec was set to 1.5 to 2). The generator is sequential and a few batches are slow (max between 3 and 16 s in the logs of the five passes), while the predictor itself reports p95 near 9 ms for its predict step, so the slow part is not that step. The cause is still not measured.
+
+## Attempted run with 30 trials (2026-11-09)
+
+The pipeline was run once with the committed `components/tuning_config.json` (`n_trials` 30, five families, `cv_folds` 5, `parallelism` 2) and it did not finish: **this node cannot sustain it**. The registered champion stays `churn` v2 (`hist_gradient_boosting`, hold-out AUC 0.93487, from the 3-trial run), and the InferenceService still serves it (same `uid`).
+
+What happened (run `5ba1f316-bad8-45cb-84d3-95e9f005775d`, workflow `churn-training-r6d7n`, submitted at 03:08Z, node gate before it: load 1.97, 2192 MB available):
+
+- The KFP flake hit the drivers of `preprocess` and `load-config` (`GetContextByTypeAndName ... Unavailable` against `metadata-grpc`, before any of our code ran). Three retries of the same run (one by hand, two by a watcher that retried only when every failed pod was a `*-driver`) moved it forward each time, and the steps already finished were kept. Four `iteration-item` driver pods also failed with the same error before one succeeded.
+- Ingest, Preprocess and Load config finished. The first Tune to finish was LightGBM: **best CV AUC 0.9340, 19 trials complete and 11 pruned, in 5 min 25 s** (03:18:27Z to 03:23:52Z), against about 21 s for the same study on the laptop.
+- Around 03:21Z the node reached a **load average of 231** (111 and 44 for 5 and 15 minutes) and the API server stopped answering. The KFP control plane restarted in a loop: `metadata-grpc` 16 times, `ml-pipeline` 12, `cache-server` 16, the UI 21, the visualization server 19, `workflow-controller` 17. MLflow did not answer through its port-forward either. The workflow ended `Failed` at 03:24:15Z, and the load had fallen to 8 by 03:27Z.
+- The cause of the load storm was **not proven**. What was measured: the node container has 8 CPUs (`cpu.max 800000 100000`) and, since it started, 21,936 of 110,638 periods were throttled (13,228 s throttled against 22,303 s of CPU used). Several KFP images run under Rosetta (`/run/rosetta/rosetta` in the process list).
+- Mitigations that were **not tried**: `docker update --cpus=11 minikube`, lowering the `parallelism` of Tune from 2 to 1, or running fewer families. The user decided to stop instead.
+- Cleanup: the 4 pods in `Error` were deleted, and the port-forwards and watchers were closed. MLflow keeps one partial run of the family LightGBM tagged with that `kfp_run_id`, without a gate; it does not touch the alias `champion`.
+
+Local simulation (laptop, **not pipeline results**): a script outside the repo repeated what Tune does (same 80/20 split with `SEED` 42, 5-fold stratified CV on the 12,000 train rows, TPE with seed 42, `MedianPruner`, no MLflow) and scored the hold-out once for the best configuration of each family, as Evaluate does:
+
+| Family | CV AUC | Hold-out AUC | Search |
+|---|---|---|---|
+| XGBoost | 0.9345 | 0.9359 | committed ranges, 30 trials |
+| LightGBM | 0.9340 | 0.9356 | committed ranges, 30 trials |
+| HistGradientBoosting | 0.9341 | 0.9350 | committed ranges, 30 trials |
+| Random Forest | 0.9295 | 0.9314 | committed ranges, 30 trials |
+| LogReg | 0.877 | 0.886 | committed ranges, 30 trials |
+| XGBoost | 0.9348 | 0.9356 | wide ranges, 250 trials |
+| HistGradientBoosting | 0.9345 | 0.9357 | wide ranges, 250 trials |
+| LightGBM | 0.9337 | 0.9339 | wide ranges, 250 trials |
+
+The LightGBM figure of the cluster (CV 0.9340) matches the local one (0.93404). A search 8 times larger, with wider ranges and more parameters, gained at most 0.0003 of CV, so the committed ranges are already at the plateau of this data (synthetic, and a hold-out of 3,000 rows whose AUC has an error near 0.005).
+
+One finding that was not applied: `HistGradientBoostingClassifier` turns `early_stopping` on by itself above 10,000 rows. The CV folds have 9,600 rows and do not use it, but the refit of Evaluate (12,000) and the one of Register (15,000) do. Fixing `early_stopping: false` in `tuning_config.json` would make the tuned and the deployed models the same.
+
+### Kaggle score (2026-11-09)
+
+The `submission.csv` of the champion v2 (generated by the load generator from the served model, `RESULT ok` in `tools/check_submission.py`) was uploaded by hand to the competition `bank-customer-churn-prediction-challeng-zhenliu`: **public score 0.92989**. The hold-out AUC of that model was 0.93487 and its CV AUC 0.9326, so the public score is about 0.005 under the hold-out, which is the size of the error of a 3,000-row hold-out. The public score is computed on part of the test set only. The level fits ROC-AUC (an accuracy would be near 0.86), but the metric of the competition is still not confirmed from its page.
+
