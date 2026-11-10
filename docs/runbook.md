@@ -776,3 +776,19 @@ Checked with the helper pod `k8s/data-loader-pod.yaml` and a temporary pod with 
 - the script imports only the standard library and `config`.
 
 Result: 24 of 24 checks passed. To run the generator locally: `PYTHONPATH=components:tools uv run python tools/load_generator.py --url <endpoint> --data data/test.csv --output /tmp/submission.csv --metrics-port 0`.
+
+### Submission check, local (step 3, 2026-11-09)
+
+```bash
+uv run python tools/check_submission.py <submission.csv> [--sample data/sample_submission.csv]
+```
+
+Exits 0 and prints one `RESULT ok` line only if the header is exactly `id,Exited`, there are 10,000 rows, the ids equal those of the sample file in the same order, and every `Exited` is a number in [0, 1]. Otherwise it prints `RESULT fail: <first violation>` and exits 1. Standard library only, so it needs no `PYTHONPATH`.
+
+Checked with `data/sample_submission.csv` (passes) and with copies written to a temporary folder (the check script is not in the repo). 17 of 17 cases gave the expected result:
+
+- **Valid:** the sample file, a file with 10,000 random probabilities, and a file with the boundary values 0 and 1.
+- **The six cases of the spec, each exit 1 naming the violation:** a missing row (`there are 9999 rows`), a changed id (`row 5 has id '99999', the sample has '15004'`), two ids swapped (the first of the two rows), a `NaN`, a value of 1.2, and a wrong header.
+- **More, each exit 1:** an extra row, text instead of a number, a negative value, an empty value, `inf`, a row with one column, a file that does not exist and an empty file.
+
+Gotcha: the check proves format, ids and range, not that row N got the prediction of row N. The order of the answers is proven by the local test of the generator (step 2), and `0.5` everywhere, as in the sample file, also passes.
