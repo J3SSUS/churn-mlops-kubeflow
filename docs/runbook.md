@@ -824,3 +824,37 @@ kubectl delete pod -n kubeflow data-loader
 - The first row of the file (`id` 15000, `0.23956915975642623`) equals the `p1` the endpoint gave for the same row in step 1.
 
 Observation: **the target rate of 2 requests per second was not held** (1.47 achieved). Most batches are fast (p50 11 ms), but a few are slow (p95 1.6 s, max 7.7 s), and being sequential, each slow one delays the rest. This is the risk of the spec about the rate; the cause of the slow batches is not known yet (a cold first request, CPU throttling of the predictor, or the scrape of Prometheus are guesses, not measured).
+
+### Prometheus scrapes the generator (step 5, 2026-11-09)
+
+```bash
+kubectl apply -f k8s/networkpolicy-allow-monitoring.yaml -f k8s/load-generator-podmonitor.yaml
+# allow-monitoring-scrape: unchanged; allow-monitoring-scrape-load-generator and PodMonitor load-generator: created
+```
+
+Node gate before each Job: load average between 0.6 and 2.1, at least 2.2 GB available.
+
+**Run of 2 passes.** The Job `Complete`d (exit 0, 200 requests, 0 errors). Prometheus saw `load_requests_total{result="ok"}` rise (97, 127, 148, 176 over the run) and `result="error"` stay at 0. The last scrape missed the tail (176 of 200), because the pod ends and nothing scrapes it again: totals on the dashboard of a short Job are a little low.
+
+**Run against a model that does not exist** (`--url .../v1/models/nope:predict --retry-pause 10`):
+
+- The log shows `removed a stale /mnt/data/submission.csv` at the start, 4 attempts that answered 404, and `FAILED: ... failed after 4 attempts`. The pod ended `Failed`, `exit=1`, and the Job `failed=1`.
+- Prometheus saw `result="error"` at 2 at 02:11:51, before the pod ended at 02:12:01 (the final value was 4, the last scrape did not catch it), and `result="ok"` at 0.
+- The PVC has neither `submission.csv` nor `submission.csv.tmp` afterwards (checked with the helper pod).
+- A successful Job after it (1 pass, 53 s, 100 ok, 0 errors) wrote the file again, and `tools/check_submission.py data/submission.csv` printed `RESULT ok` with the same min and max as before.
+
+**Time until the target is up** (first `up` sample of the pod, from `query_range`, against the start of the container):
+
+| Run | Container started | First `up=1` | Delay |
+|---|---|---|---|
+| 2 passes, PodMonitor created seconds before | 02:09:00 | 02:09:58 | 58 s |
+| bad model | 02:11:30 | 02:11:51 | 21 s |
+| 1 pass | 02:13:01 | 02:13:16 | 15 s |
+
+The first run missed the 30 s of the spec because the PodMonitor was new: the operator has to regenerate and reload the configuration of Prometheus before it discovers any pod. Once settled, the target is up in 15 to 21 s. Create the PodMonitor a minute before the first Job.
+
+Gotchas:
+
+- The `job` label of a PodMonitor target is `monitoring/load-generator` (namespace and name of the PodMonitor), not the name of the pod. To find the target of a run, filter by `pod`, for example `up{pod="load-generator-xxxxx"}`.
+- `GET /api/v1/targets` lists only live pods. After the Job ends the target is gone and `up` has one last sample at 0, so to check a past run use `query_range` on `up`, `load_requests_total` and the pod name.
+- Achieved rate in the three runs with traffic: 1.82, 1.79 and 1.87 requests per second (1.47 in the first run of step 4), with a p95 batch latency between 0.2 and 0.8 s. The slow batches vary from run to run; the cause is still not known.

@@ -1,0 +1,18 @@
+# Prometheus scrapes the load generator Job pod (SPEC 09, E4.5), port "metrics" (9100).
+# The Job pod carries the label app=load-generator. Applied by hand:
+#   kubectl apply -f k8s/load-generator-podmonitor.yaml
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: load-generator
+  namespace: monitoring
+spec:
+  namespaceSelector:
+    matchNames: [kubeflow]
+  selector:
+    matchLabels:
+      app: load-generator
+  podMetricsEndpoints:
+    - port: metrics
+      path: /metrics
+      interval: 15s
