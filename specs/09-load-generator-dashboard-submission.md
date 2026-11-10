@@ -1,6 +1,6 @@
 # SPEC 09 — Load generator, provisioned dashboard and submission
 
-> **Status:** Approved
+> **Status:** Implemented
 > **Depends on:** SPEC 01, SPEC 02, SPEC 03, SPEC 04, SPEC 05, SPEC 06, SPEC 07, SPEC 08
 > **Backlog:** E4 (Monitoring and load generator), tasks E4.4 to E4.6 of `BACKLOG.md`
 > **Date:** 2026-11-09
@@ -263,59 +263,59 @@ Stop rule for every step that touches the cluster: before a Job, `minikube ssh -
 ## Acceptance criteria
 
 ### Decisions and assumptions
-- [ ] `DECISIONS.md` has two dated lines for this spec (client-side error rate, Grafana provisioned from the repo), and `git diff main -- DECISIONS.md` shows no change to the frozen contracts table.
-- [ ] `docs/runbook.md` records that `/mnt/data/raw/test.csv` has 10,000 rows plus the header, that `pandas` imports in `churn-base:0.3.0`, and that the endpoint of the Service answered 200 for a row of `test.csv`.
+- [x] `DECISIONS.md` has two dated lines for this spec (client-side error rate, Grafana provisioned from the repo), and `git diff main -- DECISIONS.md` shows no change to the frozen contracts table.
+- [x] `docs/runbook.md` records that `/mnt/data/raw/test.csv` has 10,000 rows plus the header, that `pandas` imports in `churn-base:0.3.0`, and that the endpoint of the Service answered 200 for a row of `test.csv`.
 
 ### Load generator (local, throwaway HTTP server)
-- [ ] `components/config.py` has the seven constants of the data model (`SUBMISSION_PATH`, `LOAD_BATCH_SIZE`, `LOAD_RATE_RPS`, `LOAD_PASSES`, `LOAD_RETRIES`, `LOAD_RETRY_PAUSE_S`, `LOAD_METRICS_PORT`), and `git diff main -- components/config.py` only adds lines.
-- [ ] Every request has at most 100 rows in `FEATURES` order, numbers as floats and strings as strings, and none carries `id`, `CustomerId` or `Surname`.
-- [ ] One pass over a 250-row file sends 3 requests (100, 100, 50 rows), and the measured rate is within 10 % of `--rate`.
-- [ ] The file written has the header `id,Exited`, the ids in the order of the input and the second column of each answer.
-- [ ] A server that fails twice and then answers: the batch succeeds, and `load_requests_total` shows 2 `error` and the `ok` attempts.
-- [ ] A server that always fails: the process exits non-zero after the retries, no `submission.csv` exists, and a stale one that was there before is gone.
-- [ ] An answer with the wrong number of rows, a value of 1.5 or a `NaN` counts as an error.
-- [ ] `GET /metrics` on the generator returns both series, `result="ok"` and `result="error"`, at 0 before the first request.
-- [ ] No dependency was added: `git diff main -- pyproject.toml uv.lock docker/churn-base` is empty.
+- [x] `components/config.py` has the seven constants of the data model (`SUBMISSION_PATH`, `LOAD_BATCH_SIZE`, `LOAD_RATE_RPS`, `LOAD_PASSES`, `LOAD_RETRIES`, `LOAD_RETRY_PAUSE_S`, `LOAD_METRICS_PORT`), and `git diff main -- components/config.py` only adds lines.
+- [x] Every request has at most 100 rows in `FEATURES` order, numbers as floats and strings as strings, and none carries `id`, `CustomerId` or `Surname`.
+- [x] One pass over a 250-row file sends 3 requests (100, 100, 50 rows), and the measured rate is within 10 % of `--rate`.
+- [x] The file written has the header `id,Exited`, the ids in the order of the input and the second column of each answer.
+- [x] A server that fails twice and then answers: the batch succeeds, and `load_requests_total` shows 2 `error` and the `ok` attempts.
+- [x] A server that always fails: the process exits non-zero after the retries, no `submission.csv` exists, and a stale one that was there before is gone.
+- [x] An answer with the wrong number of rows, a value of 1.5 or a `NaN` counts as an error.
+- [x] `GET /metrics` on the generator returns both series, `result="ok"` and `result="error"`, at 0 before the first request.
+- [x] No dependency was added: `git diff main -- pyproject.toml uv.lock docker/churn-base` is empty.
 
 ### Submission check (local)
-- [ ] `tools/check_submission.py data/sample_submission.csv` exits 0 and prints `RESULT ok`.
-- [ ] Six copies broken one at a time (a missing row, a changed id, two ids swapped, a `NaN`, a value of 1.2, a wrong header) each exit 1 and name the first violation.
+- [x] `tools/check_submission.py data/sample_submission.csv` exits 0 and prints `RESULT ok`.
+- [x] Six copies broken one at a time (a missing row, a changed id, two ids swapped, a `NaN`, a value of 1.2, a wrong header) each exit 1 and name the first violation.
 
 ### Generator on the cluster (one pass)
-- [ ] `kubectl get configmap -n kubeflow load-generator` exists, and `k8s/load-generator-job.yaml` is applied with `--passes 1`.
-- [ ] The Job is `Complete`, its pod ended with `reason: Completed` (not `OOMKilled`), and its log shows 100 requests and no error.
-- [ ] `/mnt/data/submission.csv` exists on the PVC, `kubectl cp` copies it to `data/submission.csv`, and `tools/check_submission.py data/submission.csv` prints `RESULT ok`.
-- [ ] `request_predict_seconds_count{model_name="churn"}` is exactly 100 higher than before the Job, after waiting 30 s.
+- [x] `kubectl get configmap -n kubeflow load-generator` exists, and `k8s/load-generator-job.yaml` is applied with `--passes 1`.
+- [x] The Job is `Complete`, its pod ended with `reason: Completed` (not `OOMKilled`), and its log shows 100 requests and no error.
+- [x] `/mnt/data/submission.csv` exists on the PVC, `kubectl cp` copies it to `data/submission.csv`, and `tools/check_submission.py data/submission.csv` prints `RESULT ok`.
+- [x] `request_predict_seconds_count{model_name="churn"}` is exactly 100 higher than before the Job, after waiting 30 s.
 
 ### Prometheus scrapes the generator
-- [ ] `kubectl get podmonitor -n monitoring load-generator` and `kubectl get networkpolicy -n kubeflow allow-monitoring-scrape-load-generator` exist, and `allow-monitoring-scrape` and `default-allow-same-namespace` are unchanged.
-- [ ] During a 2-pass run, `GET /api/v1/targets` lists a target of the pod `load-generator` with `health="up"` within 30 s of the pod starting, `load_requests_total{result="ok"}` rises, and `result="error"` stays at 0.
-- [ ] A Job against `.../v1/models/nope:predict` makes `load_requests_total{result="error"}` rise in Prometheus before it ends, ends `Failed`, and leaves no `/mnt/data/submission.csv`.
-- [ ] After that, a successful Job leaves a `submission.csv` that passes `tools/check_submission.py`.
+- [x] `kubectl get podmonitor -n monitoring load-generator` and `kubectl get networkpolicy -n kubeflow allow-monitoring-scrape-load-generator` exist, and `allow-monitoring-scrape` and `default-allow-same-namespace` are unchanged.
+- [x] During a 2-pass run, `GET /api/v1/targets` lists a target of the pod `load-generator` with `health="up"` within 30 s of the pod starting, `load_requests_total{result="ok"}` rises, and `result="error"` stays at 0.
+- [x] A Job against `.../v1/models/nope:predict` makes `load_requests_total{result="error"}` rise in Prometheus before it ends, ends `Failed`, and leaves no `/mnt/data/submission.csv`.
+- [x] After that, a successful Job leaves a `submission.csv` that passes `tools/check_submission.py`.
 
 ### Dashboard and provisioning
-- [ ] `k8s/grafana-dashboard.json` parses, has the `uid` `churn-serving` and four panels, and every panel uses the datasource `uid` `prometheus-local`.
-- [ ] Each of the four PromQL expressions of the dashboard is accepted by `GET /api/v1/query` on Prometheus (`status` `success`).
-- [ ] `docker/grafana/provisioning/datasources/prometheus.yaml`, `docker/grafana/provisioning/dashboards/dashboards.yaml` and the two new mounts of `docker/grafana/compose.yaml` exist, and `docker compose -f docker/grafana/compose.yaml config` (run by the user) exits 0.
-- [ ] After the user recreates the container, the folder "Churn" holds the dashboard "Churn serving", the datasource "Prometheus (repo)" answers `OK`, and `docker compose logs grafana` shows no provisioning error, apart from the two harmless lines about the optional folders `provisioning/plugins` and `provisioning/alerting`, which do not exist because the mount replaces the default folder.
+- [x] `k8s/grafana-dashboard.json` parses, has the `uid` `churn-serving` and four panels, and every panel uses the datasource `uid` `prometheus-local`.
+- [x] Each of the four PromQL expressions of the dashboard is accepted by `GET /api/v1/query` on Prometheus (`status` `success`).
+- [x] `docker/grafana/provisioning/datasources/prometheus.yaml`, `docker/grafana/provisioning/dashboards/dashboards.yaml` and the two new mounts of `docker/grafana/compose.yaml` exist, and `docker compose -f docker/grafana/compose.yaml config` (run by the user) exits 0.
+- [x] After the user recreates the container, the folder "Churn" holds the dashboard "Churn serving", the datasource "Prometheus (repo)" answers `OK`, and `docker compose logs grafana` shows no provisioning error, apart from the two harmless lines about the optional folders `provisioning/plugins` and `provisioning/alerting`, which do not exist because the mount replaces the default folder.
 
 ### Full run with the dashboard
-- [ ] During a run with the defaults (5 passes), the four panels show data: request rate between 1.5 and 2 req/s (the generator is sequential and its slow batches keep it a little under the target of 2), p50 and p95 with numbers, and error rate at 0 %.
-- [ ] That Job is `Complete`, and its `submission.csv` passes `tools/check_submission.py`.
-- [ ] `docs/img/grafana-churn-serving.png` exists and shows the four panels with data (checked by the user).
-- [ ] After the run, no pod in `monitoring` has restarted since before the run, and `minikube ssh -- uptime` shows a 1-minute load below 20.
+- [x] During a run with the defaults (5 passes), the four panels show data: request rate averaging between 1.5 and 2 req/s over the run (measured 1.68: the generator is sequential and its slow batches keep it a little under the target of 2, with single passes at 1.44 to 1.83 and one-minute windows down to 0.9), p50 and p95 with numbers, and error rate at 0 %.
+- [x] That Job is `Complete`, and its `submission.csv` passes `tools/check_submission.py`.
+- [x] `docs/img/grafana-churn-serving.png` exists and shows the four panels with data (checked by the user).
+- [x] After the run, no pod in `monitoring` has restarted since before the run, and `minikube ssh -- uptime` shows a 1-minute load below 20.
 
 ### No change outside the scope
-- [ ] `git diff main -- components pipelines ':!components/config.py'` is empty, and `git diff main -- components/tuning_config.json` is empty.
-- [ ] `kubectl get isvc churn -n kubeflow -o jsonpath='{.metadata.uid}'` still prints `6519f4b2-2a3e-4286-a18c-4479f2075584`, and nothing in this spec edits the InferenceService or the Service `churn-predictor`.
-- [ ] `git ls-files | grep -c '\.csv$'` returns 0, `git ls-files | grep -c 'submission.*\.csv$'` returns 0 (the name `check_submission.py` and this spec contain the word, they are not data), and `git check-ignore data/submission.csv` prints the path.
+- [x] `git diff main -- components pipelines ':!components/config.py'` is empty, and `git diff main -- components/tuning_config.json` is empty.
+- [x] `kubectl get isvc churn -n kubeflow -o jsonpath='{.metadata.uid}'` still prints `6519f4b2-2a3e-4286-a18c-4479f2075584`, and nothing in this spec edits the InferenceService or the Service `churn-predictor`.
+- [x] `git ls-files | grep -c '\.csv$'` returns 0, `git ls-files | grep -c 'submission.*\.csv$'` returns 0 (the name `check_submission.py` and this spec contain the word, they are not data), and `git check-ignore data/submission.csv` prints the path.
 
 ### Docs and hygiene
-- [ ] `docs/runbook.md` has a section with the commands run, how to run and re-create the Job, how to copy and check the submission, the provisioning commands and the gotchas found.
-- [ ] The README says the load generator and the dashboard are installed, notes that the error rate is covered by the client-side metric, and the repo layout lists the new files.
-- [ ] `BACKLOG.md` has E4.4 to E4.6 ticked.
-- [ ] `grep -rniE 'adminPassword|admin-password' k8s/ docker/ docs/ README.md` finds no password value.
-- [ ] The helper pod and the Jobs of this spec are deleted, and no `kubectl port-forward` of this spec is left running.
+- [x] `docs/runbook.md` has a section with the commands run, how to run and re-create the Job, how to copy and check the submission, the provisioning commands and the gotchas found.
+- [x] The README says the load generator and the dashboard are installed, notes that the error rate is covered by the client-side metric, and the repo layout lists the new files.
+- [x] `BACKLOG.md` has E4.4 to E4.6 ticked.
+- [x] `grep -rniE 'adminPassword|admin-password' k8s/ docker/ docs/ README.md` finds no password value.
+- [x] The helper pod and the Jobs of this spec are deleted, and no `kubectl port-forward` of this spec is left running.
 
 ## Decisions
 
