@@ -664,7 +664,7 @@ Result (Helm 4.3.1, no cluster needed): exit 0. The output has no Alertmanager, 
 Gotchas:
 
 - The render still provisions a Grafana datasource named "Alertmanager" (it points at a service that does not exist) and keeps the operator RBAC for `alertmanagers`. Harmless; ignore the red datasource in Grafana.
-- `adminPassword` is not in the values. The only `admin-password` in the render is the `Secret` the chart generates (random on every render, and `helm template` output is not committed).
+- The first render still had Grafana (before it moved out of the cluster), and its generated Secret was the only place with a password. With `grafana.enabled: false` the render has no Grafana object and no password at all.
 
 ### Gates before the install (step 1, measured 2026-11-09 after `minikube start`)
 

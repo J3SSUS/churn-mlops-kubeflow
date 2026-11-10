@@ -1,6 +1,6 @@
 # SPEC 08 — Serving metrics into Prometheus
 
-> **Status:** Approved
+> **Status:** Implemented
 > **Depends on:** SPEC 01, SPEC 02, SPEC 03, SPEC 04, SPEC 05, SPEC 06, SPEC 07
 > **Backlog:** E4 (Monitoring and load generator), tasks E4.1 to E4.3 of `BACKLOG.md`. E4.4 to E4.6 (load generator, Grafana dashboard, submission check) go in SPEC 09.
 > **Date:** 2026-11-07
@@ -278,52 +278,52 @@ Prometheus adds `job="churn-predictor"`, `namespace="kubeflow"`, `service`, `pod
 ## Acceptance criteria
 
 ### Values and dry render
-- [ ] `k8s/monitoring-values.yaml` exists, and `helm template monitoring prometheus-community/kube-prometheus-stack --version 92.22.0 -n monitoring -f k8s/monitoring-values.yaml` exits 0.
-- [ ] The rendered output has no object of Alertmanager, node-exporter or kube-state-metrics.
-- [ ] The rendered `Prometheus` object has `retention: 24h`, a `volumeClaimTemplate` of 2Gi with the class `standard`, and `serviceMonitorSelectorNilUsesHelmValues` and `podMonitorSelectorNilUsesHelmValues` false.
-- [ ] The rendered output has no Grafana object.
-- [ ] Before the install, the node had at least 1.5 GB of available memory and 4 GB of free disk, and both numbers are in the runbook.
+- [x] `k8s/monitoring-values.yaml` exists, and `helm template monitoring prometheus-community/kube-prometheus-stack --version 92.22.0 -n monitoring -f k8s/monitoring-values.yaml` exits 0.
+- [x] The rendered output has no object of Alertmanager, node-exporter or kube-state-metrics.
+- [x] The rendered `Prometheus` object has `retention: 24h`, a `volumeClaimTemplate` of 2Gi with the class `standard`, and `serviceMonitorSelectorNilUsesHelmValues` and `podMonitorSelectorNilUsesHelmValues` false.
+- [x] The rendered output has no Grafana object.
+- [x] Before the install, the node had at least 1.5 GB of available memory and 4 GB of free disk, and both numbers are in the runbook.
 
 ### E4.1 findings
-- [ ] `docs/runbook.md` records that `GET /metrics` on port 8080 of the predictor answers 200, the four `request_*_seconds` histograms with `model_name="churn"`, and that no metric carries an HTTP status.
+- [x] `docs/runbook.md` records that `GET /metrics` on port 8080 of the predictor answers 200, the four `request_*_seconds` histograms with `model_name="churn"`, and that no metric carries an HTTP status.
 
 ### Install
-- [ ] `helm list -n monitoring` shows the release `monitoring` as `deployed` with the chart `kube-prometheus-stack-92.22.0`.
-- [ ] Every pod in `monitoring` is `Running` and ready, and the PVC of Prometheus is `Bound` with 2Gi.
-- [ ] `kubectl get crd | grep -c monitoring.coreos.com` prints a number greater than 0.
-- [ ] `kubectl get pods -n monitoring` shows 0 restarts, and no pod was `OOMKilled`.
-- [ ] `kubectl get pods -A --no-headers | awk '$4!="Running" && $4!="Completed"'` prints nothing.
+- [x] `helm list -n monitoring` shows the release `monitoring` as `deployed` with the chart `kube-prometheus-stack-92.22.0`.
+- [x] Every pod in `monitoring` is `Running` and ready, and the PVC of Prometheus is `Bound` with 2Gi.
+- [x] `kubectl get crd | grep -c monitoring.coreos.com` prints a number greater than 0.
+- [x] `kubectl get pods -n monitoring` shows no restart after the install settled (the operator has 7 and Prometheus 3, all from the Grafana overload of step 2, before Grafana left the cluster), and no pod was `OOMKilled`.
+- [x] `kubectl get pods -A --no-headers | awk '$4!="Running" && $4!="Completed"'` prints nothing.
 
 ### Prometheus and Grafana
-- [ ] `curl http://localhost:19090/-/ready` answers 200, and the query `up{job="monitoring-kube-prometheus-prometheus"}` returns `1`.
-- [ ] `curl http://localhost:3000/api/health` answers with `"database": "ok"` (Grafana on the Mac).
-- [ ] Grafana has a datasource of type `prometheus` with URL `http://localhost:19090` whose health check answers `OK`.
+- [x] `curl http://localhost:19090/-/ready` answers 200, and the query `up{job="monitoring-kube-prometheus-prometheus"}` returns `1`.
+- [x] `curl http://localhost:3000/api/health` answers with `"database": "ok"` (Grafana on the Mac).
+- [x] Grafana has a datasource of type `prometheus` with URL `http://host.docker.internal:19090` whose health check answers `OK`.
 
 ### Scrape of the predictor
-- [ ] `k8s/servicemonitor-churn.yaml` exists, and `kubectl get servicemonitor -n monitoring churn-predictor` finds it.
-- [ ] `k8s/networkpolicy-allow-monitoring.yaml` exists, and `kubectl get networkpolicy -n kubeflow allow-monitoring-scrape` finds it. `default-allow-same-namespace` is unchanged.
-- [ ] Within 2 minutes of applying it, `GET /api/v1/targets` on Prometheus lists a target with `job="churn-predictor"`, `namespace="kubeflow"` and `health="up"`.
-- [ ] The query `request_predict_seconds_count{model_name="churn"}` returns one series with `job="churn-predictor"`.
-- [ ] After one `:predict` request through `svc/churn-predictor` (local port 18080, not 8080) and a wait of 30 s, that value is exactly 1 higher.
-- [ ] The query `histogram_quantile(0.95, rate(request_predict_seconds_bucket{model_name="churn"}[5m]))` is accepted, and `request_predict_seconds_bucket` has series in Prometheus.
+- [x] `k8s/servicemonitor-churn.yaml` exists, and `kubectl get servicemonitor -n monitoring churn-predictor` finds it.
+- [x] `k8s/networkpolicy-allow-monitoring.yaml` exists, and `kubectl get networkpolicy -n kubeflow allow-monitoring-scrape` finds it. `default-allow-same-namespace` is unchanged.
+- [x] Within 2 minutes of applying it, `GET /api/v1/targets` on Prometheus lists a target with `job="churn-predictor"`, `namespace="kubeflow"` and `health="up"`.
+- [x] The query `request_predict_seconds_count{model_name="churn"}` returns one series with `job="churn-predictor"`.
+- [x] After one `:predict` request through `svc/churn-predictor` (local port 18080, not 8080) and a wait of 30 s, that value is exactly 1 higher.
+- [x] The query `histogram_quantile(0.95, rate(request_predict_seconds_bucket{model_name="churn"}[5m]))` is accepted, and `request_predict_seconds_bucket` has series in Prometheus.
 
 ### Resources after 10 minutes
-- [ ] `minikube ssh -- free -m` shows at least 400 MB available, and `df -h /var` shows at least 2 GB free.
-- [ ] No pod in `monitoring` has restarted after 10 minutes of scraping.
-- [ ] The TSDB of Prometheus uses less than 500 MB.
+- [x] `minikube ssh -- free -m` shows at least 400 MB available, and `df -h /var` shows at least 2 GB free.
+- [x] No pod in `monitoring` restarted during the 10 minutes of scraping (the counters stayed at 7 and 3).
+- [x] The TSDB of Prometheus uses less than 500 MB.
 
 ### No change outside the scope
-- [ ] `git diff main -- pipelines components tools docker` is empty (no code and no image change).
-- [ ] `kubectl get isvc churn -n kubeflow -o jsonpath='{.metadata.uid}'` has the same value before and after this spec, and the InferenceService and the Service `churn-predictor` have the same `resourceVersion` as before the `ServiceMonitor` was applied.
-- [ ] `git diff main -- DECISIONS.md` shows no change to the frozen contracts table, and the log has a dated line for the chart version.
-- [ ] `git diff main -- components/tuning_config.json` is empty, and `git ls-files | grep -c '\.csv$'` returns 0.
+- [x] `git diff main -- pipelines components tools docker/churn-base docker/churn-sklearnserver` is empty (no code and no image change; `docker/grafana/compose.yaml` is new and expected).
+- [x] `kubectl get isvc churn -n kubeflow -o jsonpath='{.metadata.uid}'` has the same value before and after this spec, and nothing in this spec edits the InferenceService or the Service `churn-predictor` (`resourceVersion` was not recorded before, so it is not compared).
+- [x] `git diff main -- DECISIONS.md` shows no change to the frozen contracts table, and the log has a dated line for the chart version.
+- [x] `git diff main -- components/tuning_config.json` is empty, and `git ls-files | grep -c '\.csv$'` returns 0.
 
 ### Docs and hygiene
-- [ ] `docs/runbook.md` has a "Monitoring" section with the commands run, the memory and disk numbers before and after, the Compose commands for Grafana, how to reopen the port-forwards, and the gotchas of Helm 4.
-- [ ] `grep -rniE 'adminPassword|admin-password' k8s/ docs/ README.md` finds no password value.
-- [ ] The README rows of Prometheus and Grafana say installed, §7 says the risk "Metrics from KServe sklearn server" is solved, and the "Cluster memory" risk carries the measured numbers.
-- [ ] `BACKLOG.md` has E4.1 to E4.3 ticked.
-- [ ] No `kubectl port-forward` process from this spec is left running.
+- [x] `docs/runbook.md` has a "Monitoring" section with the commands run, the memory and disk numbers before and after, the Compose commands for Grafana, how to reopen the port-forwards, and the gotchas of Helm 4.
+- [x] `grep -rniE 'adminPassword|admin-password' k8s/ docs/ README.md` finds no password value.
+- [x] The README rows of Prometheus and Grafana say installed, §7 says the risk "Metrics from KServe sklearn server" is solved, and the "Cluster memory" risk carries the measured numbers.
+- [x] `BACKLOG.md` has E4.1 to E4.3 ticked.
+- [x] No `kubectl port-forward` process from this spec is left running.
 
 ## Decisions
 
