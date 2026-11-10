@@ -297,7 +297,7 @@ Stop rule for every step that touches the cluster: before a Job, `minikube ssh -
 - [ ] `k8s/grafana-dashboard.json` parses, has the `uid` `churn-serving` and four panels, and every panel uses the datasource `uid` `prometheus-local`.
 - [ ] Each of the four PromQL expressions of the dashboard is accepted by `GET /api/v1/query` on Prometheus (`status` `success`).
 - [ ] `docker/grafana/provisioning/datasources/prometheus.yaml`, `docker/grafana/provisioning/dashboards/dashboards.yaml` and the two new mounts of `docker/grafana/compose.yaml` exist, and `docker compose -f docker/grafana/compose.yaml config` (run by the user) exits 0.
-- [ ] After the user recreates the container, the folder "Churn" holds the dashboard "Churn serving", the datasource "Prometheus (repo)" answers `OK`, and `docker compose logs grafana` shows no provisioning error.
+- [ ] After the user recreates the container, the folder "Churn" holds the dashboard "Churn serving", the datasource "Prometheus (repo)" answers `OK`, and `docker compose logs grafana` shows no provisioning error, apart from the two harmless lines about the optional folders `provisioning/plugins` and `provisioning/alerting`, which do not exist because the mount replaces the default folder.
 
 ### Full run with the dashboard
 - [ ] During a run with the defaults (5 passes), the four panels show data: request rate close to 2 req/s, p50 and p95 with numbers, and error rate at 0 %.

@@ -858,3 +858,35 @@ Gotchas:
 - The `job` label of a PodMonitor target is `monitoring/load-generator` (namespace and name of the PodMonitor), not the name of the pod. To find the target of a run, filter by `pod`, for example `up{pod="load-generator-xxxxx"}`.
 - `GET /api/v1/targets` lists only live pods. After the Job ends the target is gone and `up` has one last sample at 0, so to check a past run use `query_range` on `up`, `load_requests_total` and the pod name.
 - Achieved rate in the three runs with traffic: 1.82, 1.79 and 1.87 requests per second (1.47 in the first run of step 4), with a p95 batch latency between 0.2 and 0.8 s. The slow batches vary from run to run; the cause is still not known.
+
+### Dashboard and provisioning (step 6, 2026-11-09)
+
+Files: `k8s/grafana-dashboard.json`, `docker/grafana/provisioning/datasources/prometheus.yaml`, `docker/grafana/provisioning/dashboards/dashboards.yaml`, and two new read-only mounts in `docker/grafana/compose.yaml` (`./provisioning` and the JSON).
+
+Checks before touching Grafana (port-forward `19090` open):
+
+- The JSON parses, has the `uid` `churn-serving` and 4 panels, and every panel and every target uses the datasource `uid` `prometheus-local`.
+- Each of the 4 PromQL expressions answered `status: success` on `GET /api/v1/query`. With no traffic and no Job running they gave: request rate 0, error rate no series, p50 and p95 `NaN`.
+
+Commands run by the user, then:
+
+```bash
+docker compose -f docker/grafana/compose.yaml config > /dev/null && echo "config ok"
+docker compose -f docker/grafana/compose.yaml up -d                      # recreates the container with the new mounts
+docker compose -f docker/grafana/compose.yaml logs grafana 2>&1 | grep -iE "provision|error" | tail -15
+curl -s http://localhost:3000/api/health                                 # "database": "ok", 13.3.0
+```
+
+Logs: `inserting datasource from configuration name="Prometheus (repo)" uid=prometheus-local`, and `starting to provision dashboards` followed by `finished to provision dashboards`. In the UI the folder "Churn" holds the dashboard "Churn serving", and its four panels draw the data of the earlier runs, so the provisioned datasource reaches Prometheus through `host.docker.internal:19090`.
+
+Gotchas:
+
+- **Two `level=error` lines are normal here:** `Failed to read plugin provisioning files ... provisioning/plugins` and `can't read alerting provisioning files ... provisioning/alerting`. The mount replaces Grafana's default `/etc/grafana/provisioning`, which has the optional folders `plugins` and `alerting`; ours has only `datasources` and `dashboards`. They do not affect the datasource or the dashboard (decision of the user: keep them, no empty folders).
+- The volume `grafana-data` survives the recreation, so the password and the datasource made by hand in SPEC 08 are still there next to "Prometheus (repo)".
+- The dashboard is read-only (`disableDeletion`, and the mounted file cannot be saved to). Edit `k8s/grafana-dashboard.json` and restart the container (`docker compose -f docker/grafana/compose.yaml restart`).
+
+What the panels showed after the earlier runs:
+
+- **Request rate** peaked near 2 requests per second in the 2-pass run and the 1-pass run, and fell to 0 between them.
+- **Latency of the predictor** is small: p50 about 3 ms and p95 about 8 to 9 ms. The generator saw much slower batches (p95 between 0.2 and 1.6 s, max 7.7 s). `request_predict_seconds` times only the predict step inside the server, so the slow batches are somewhere else: the rest of the request handling in the server, the network, the CPU quota of the node, or the generator itself. Not measured yet.
+- **Error rate** drew 0 % during the two successful runs and nothing for the run against the model that does not exist: its 2 errors happened before the first scrape of the new pod, so the counter showed no increase between samples (`rate` of 0 over 0). A counter of a short-lived pod loses what happens before its first scrape.
