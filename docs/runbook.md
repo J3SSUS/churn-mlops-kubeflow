@@ -701,3 +701,17 @@ Gotchas:
 - **`helm list` in Helm 4 has no `--all` flag.** Use `helm list -n monitoring` or `helm history monitoring -n monitoring`.
 - **Restarts during the incident are not a regression of the stack.** The operator shows 7 restarts and Prometheus 3, all during the minutes of overload caused by Grafana. The restart counts are checked again after the settle time of step 6.
 - Under load the API server answers `TLS handshake timeout` in bursts; a command that fails once can work 20 s later. Wait for `minikube ssh -- uptime` to drop below about 20 before changing anything.
+
+### Prometheus and Grafana answer (step 3, 2026-11-09)
+
+```bash
+kubectl port-forward -n monitoring svc/monitoring-kube-prometheus-prometheus 19090:9090   # background
+curl -s -o /dev/null -w "%{http_code}\n" http://localhost:19090/-/ready                    # 200
+# query: up{job="monitoring-kube-prometheus-prometheus"}                                   # 1 (endpoints http-web and reloader-web)
+docker compose -f docker/grafana/compose.yaml up -d                                        # run by the user
+curl -s http://localhost:3000/api/health                                                   # "database": "ok", version 13.3.0
+```
+
+Grafana datasource (created by hand in the UI, Connections, Data sources, Prometheus): URL `http://host.docker.internal:19090`. Save & test answers "Successfully queried the Prometheus API". The first login (`admin` / `admin`) asks for a new password, which is not stored anywhere in the repo.
+
+To reopen after a restart: start minikube, wait for `minikube ssh -- uptime` to drop below about 20, reopen the port-forward above, then `docker compose -f docker/grafana/compose.yaml up -d`. The datasource persists in the volume `grafana-data`; Grafana only shows data while the port-forward is open.
