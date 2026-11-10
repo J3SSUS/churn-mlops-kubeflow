@@ -640,3 +640,110 @@ All times are seconds after the `patch` (the clock of the script minus the momen
 - **The second run in KFP was not done, by decision of the user** (eight of the nine attempts failed with the same KFP flake, see above, and the patch path had already been exercised outside KFP). So the criterion "the second deploy run finishes `Succeeded` and keeps the same `uid`" is **not met as written**. What exists instead: the patch of `publish` against the real InferenceService ran nine times in a pod (three with the same spec, and six changing between v1 and v2), always with the same `uid` (`6519f4b2-2a3e-4286-a18c-4479f2075584`) and no recreation.
 - **Times.** The workflow of the first run (`churn-deploy-4cdmp`) took 9 min 22 s from the first submission to `Succeeded`, with three retries of the same run in between, so it says little about the cost of a clean run. Inside the cluster, from the logs of that run: the `fetch_champion` pod started at 03:02:52Z and logged `publish success` at 03:03:00Z (about 8 s), and a model change takes about 16 s from the patch to `publish` returning. A clean-run time was not measured.
 - **Hygiene.** The Error pods left by failed attempts were deleted. No pod is outside `Running` or `Completed`, no temporary pod or ConfigMap is left, and the node disk is at 91 % (5.2 GB free). The port-forwards to the KFP API (8888) and MLflow (5001) were still open at this point.
+
+## Monitoring (SPEC 08, E4.1 to E4.3)
+
+### E4.1 Serving metrics (measured 2026-11-07, no code needed)
+
+- `GET /metrics` on port 8080 of the predictor pod answers `200`.
+- It exposes the histograms `request_preprocess_seconds`, `request_predict_seconds`, `request_postprocess_seconds` and `request_explain_seconds`, all labelled `model_name="churn"`. The custom-predictor fallback of README §7 is not needed.
+- **There is no error metric.** No metric carries an HTTP status, so an error-rate panel cannot be built from the predictor. SPEC 09 decides how to cover it.
+- The container declares no named port and the pod annotations `prometheus.kserve.io/*` are not read (`enable-prometheus-scraping` is `"false"`). The scrape therefore goes through the Service `churn-predictor` (named port, 80 to 8080) with a `ServiceMonitor`.
+
+### Values file and dry render (step 1)
+
+```bash
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm repo update
+helm template monitoring prometheus-community/kube-prometheus-stack --version 92.22.0 \
+  -n monitoring -f k8s/monitoring-values.yaml > render.yaml
+```
+
+Result (Helm 4.3.1, no cluster needed): exit 0. The output has no Alertmanager, node-exporter or kube-state-metrics workloads. The `Prometheus` object has `retention: "24h"`, a 2Gi `volumeClaimTemplate` with class `standard` and empty `serviceMonitorSelector` / `podMonitorSelector` (the `*SelectorNilUsesHelmValues: false` effect). The Grafana Deployment has no `persistentVolumeClaim`.
+
+Gotchas:
+
+- The render still provisions a Grafana datasource named "Alertmanager" (it points at a service that does not exist) and keeps the operator RBAC for `alertmanagers`. Harmless; ignore the red datasource in Grafana.
+- The first render still had Grafana (before it moved out of the cluster), and its generated Secret was the only place with a password. With `grafana.enabled: false` the render has no Grafana object and no password at all.
+
+### Gates before the install (step 1, measured 2026-11-09 after `minikube start`)
+
+| Measure | Command | Before the install |
+|---|---|---|
+| Node memory | `minikube ssh -- free -m` | 7834 total, 4810 used, 3023 available |
+| Node disk | `minikube ssh -- df -h /var` | 59 GB, 39 GB used, 17 GB free (70 %) |
+
+Gates of the spec (at least 1.5 GB of available memory and 4 GB of free disk): both pass.
+
+Gotcha: the disk of minikube is the disk of the Docker VM. The minikube volume (about 28 GB, of which 25 GB is `/var/lib/containerd`) shares it with the host images and the build cache, so `df` inside minikube moves when the host is pruned. Right after `minikube start` the disk was at 91 % (5.2 GB free); `docker builder prune -f` on the host (4.5 GB of build cache) took it to 70 % (17 GB free). Memory right after a start is not representative: pods are still settling, so measure again a few minutes later.
+
+### Install of the chart (step 2, 2026-11-09)
+
+Final command (chart 92.22.0, Helm 4.3.1):
+
+```bash
+helm upgrade --install monitoring prometheus-community/kube-prometheus-stack \
+  --version 92.22.0 -n monitoring --create-namespace \
+  -f k8s/monitoring-values.yaml --wait --timeout 10m
+```
+
+Result: release `monitoring` `deployed` (revision 2), 13 s on the last run. Pods `monitoring-kube-prometheus-operator` and `prometheus-monitoring-kube-prometheus-prometheus-0` are `Running` and ready, the PVC of Prometheus is `Bound` (2Gi), 10 CRDs of `monitoring.coreos.com`, no `OOMKilled`. Node after: 2634 MB available, 15 GB free on `/var` (74 %), load average 11.9.
+
+What happened before (stop rule of the spec, no blind retries):
+
+- **First install, Grafana inside the chart.** `--wait` failed after 10 min: `Deployment/monitoring-grafana not ready`. The container `grafana` (Grafana 13) never opened port 3000; the kubelet killed it by liveness (exit 137, not `OOMKilled`) and it restarted 3 times in 10 min.
+- **Second try, liveness `initialDelaySeconds: 300`.** Same result after 11 min 24 s, and now `helm` and `kubectl` timed out with `TLS handshake timeout`. Inside the node the load average was 254 on 12 CPUs (Grafana, the operator, the KServe controller and the API server at 25 to 46 % CPU each). Memory was not the cause (about 1.9 GB available).
+- **Decision:** Grafana runs outside the cluster, in a container on the Mac (`docker/grafana/compose.yaml`, SPEC 08 decision), and `grafana.enabled: false`.
+
+Gotchas:
+
+- **A failed Helm upgrade can leave the release in `pending-upgrade`.** The next `helm upgrade` then says `another operation (install/upgrade/rollback) is in progress`. The status lives in a Secret: `kubectl get secret -n monitoring -l owner=helm -L status` shows it, and `kubectl delete secret -n monitoring sh.helm.release.v1.monitoring.v<N>` for the `pending-upgrade` revision unlocks it. The release stays `failed` and the next upgrade works.
+- **`helm list` in Helm 4 has no `--all` flag.** Use `helm list -n monitoring` or `helm history monitoring -n monitoring`.
+- **Restarts during the incident are not a regression of the stack.** The operator shows 7 restarts and Prometheus 3, all during the minutes of overload caused by Grafana. The restart counts are checked again after the settle time of step 6.
+- Under load the API server answers `TLS handshake timeout` in bursts; a command that fails once can work 20 s later. Wait for `minikube ssh -- uptime` to drop below about 20 before changing anything.
+
+### Prometheus and Grafana answer (step 3, 2026-11-09)
+
+```bash
+kubectl port-forward -n monitoring svc/monitoring-kube-prometheus-prometheus 19090:9090   # background
+curl -s -o /dev/null -w "%{http_code}\n" http://localhost:19090/-/ready                    # 200
+# query: up{job="monitoring-kube-prometheus-prometheus"}                                   # 1 (endpoints http-web and reloader-web)
+docker compose -f docker/grafana/compose.yaml up -d                                        # run by the user
+curl -s http://localhost:3000/api/health                                                   # "database": "ok", version 13.3.0
+```
+
+Grafana datasource (created by hand in the UI, Connections, Data sources, Prometheus): URL `http://host.docker.internal:19090`. Save & test answers "Successfully queried the Prometheus API". The first login (`admin` / `admin`) asks for a new password, which is not stored anywhere in the repo.
+
+To reopen after a restart: start minikube, wait for `minikube ssh -- uptime` to drop below about 20, reopen the port-forward above, then `docker compose -f docker/grafana/compose.yaml up -d`. The datasource persists in the volume `grafana-data`; Grafana only shows data while the port-forward is open.
+
+### Scrape of the predictor (step 4, 2026-11-09)
+
+```bash
+kubectl apply -f k8s/servicemonitor-churn.yaml
+kubectl apply -f k8s/networkpolicy-allow-monitoring.yaml
+# Prometheus: GET /api/v1/targets -> job="churn-predictor", namespace="kubeflow", health="up"
+```
+
+The `ServiceMonitor` alone left the target `down` (`Get "http://10.244.0.30:8080/metrics": context deadline exceeded`, scrape timeout of 10 s) even though the labels and the port name matched and `/metrics` answered in 38 ms through a port-forward.
+
+Gotcha: **the namespace `kubeflow` has a `NetworkPolicy` `default-allow-same-namespace`** (`podSelector: {}`, ingress only from the same namespace), enforced by kindnet. A pod in another namespace, like Prometheus in `monitoring`, is dropped silently: no error, only a timeout. `k8s/networkpolicy-allow-monitoring.yaml` adds a second policy that opens TCP 8080 of the predictor pods (`component=predictor`) to the namespace `monitoring`. Policies add up, so the existing one is untouched. After applying it the target was `up` on the first check. To diagnose this again: compare the time of `/metrics` through a port-forward (it goes through the node, not the pod network) with the scrape error, and run `kubectl get networkpolicy -A`.
+
+### Final measurement after 10 minutes (step 6, 2026-11-09)
+
+Taken 10 minutes after the check of step 5, with the target `churn-predictor` scraping every 15 s and no other traffic.
+
+| Measure | Before the install | After 10 minutes |
+|---|---|---|
+| Node memory (`minikube ssh -- free -m`) | 7834 total, 4810 used, 3023 available | 5510 used, 2323 available |
+| Node disk (`minikube ssh -- df -h /var`) | 17 GB free (70 %) | 14 GB free (77 %) |
+| Load average (1 / 5 / 15 min) | 254 at the worst (Grafana inside the cluster) | 0.32 / 1.32 / 20.0 (the 15 min value still holds the incident) |
+| Restarts in `monitoring` | none yet | operator 7, Prometheus 3: the same as before the 10 minutes, so no new restart |
+| Target `up{job="churn-predictor"}` | n/a | 1 |
+| Data of Prometheus | n/a | about 1.1 MB (WAL 976 KB, head chunks 128 KB, 1846 series) |
+
+Gotchas:
+
+- `prometheus_tsdb_storage_blocks_bytes` is `0` in the first hours. Prometheus keeps the recent data in the WAL and the head, and writes the first block only after about 2 h. To size the data early, add `prometheus_tsdb_wal_storage_size_bytes` and `prometheus_tsdb_head_chunks_storage_size_bytes`.
+- The Prometheus image has no `du` or `df`, so `kubectl exec ... du -sm /prometheus` fails. Use the metrics above.
+- The restarts counted (operator 7, Prometheus 3) are from the Grafana overload of step 2, they did not grow afterwards.
+- The disk went from 17 GB to 14 GB free after the install: the images of the stack plus the PVC.

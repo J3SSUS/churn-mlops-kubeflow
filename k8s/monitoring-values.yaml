@@ -1,0 +1,42 @@
+# Values for kube-prometheus-stack 92.22.0 (release "monitoring", namespace "monitoring").
+# Minimal stack for a tight single-node minikube: Prometheus, its operator and Grafana.
+# Install: see docs/runbook.md, section "Monitoring".
+
+defaultRules: {create: false}
+alertmanager: {enabled: false}
+nodeExporter: {enabled: false}
+kubeStateMetrics: {enabled: false}
+kubeApiServer: {enabled: false}
+kubelet: {enabled: false}
+kubeControllerManager: {enabled: false}
+kubeScheduler: {enabled: false}
+kubeProxy: {enabled: false}
+kubeEtcd: {enabled: false}
+coreDns: {enabled: false}
+kubeDns: {enabled: false}
+
+prometheusOperator:
+  resources:
+    requests: {cpu: 50m, memory: 64Mi}
+    limits: {memory: 192Mi}
+
+prometheus:
+  prometheusSpec:
+    retention: 24h
+    # Pick up ServiceMonitors / PodMonitors that do not carry the Helm release label.
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    resources:
+      requests: {cpu: 100m, memory: 256Mi}
+      limits: {memory: 640Mi}
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: standard
+          accessModes: [ReadWriteOnce]
+          resources: {requests: {storage: 2Gi}}
+
+# Grafana is not installed in the cluster: on this node Grafana 13 took minutes to open its port,
+# the kubelet killed it in a loop and the load average reached 254 (SPEC 08, step 2).
+# It runs on the laptop (Homebrew) and reads Prometheus through a port-forward.
+grafana: {enabled: false}

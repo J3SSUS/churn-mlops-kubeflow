@@ -1,0 +1,12 @@
+# Grafana for SPEC 08, outside the cluster (the node could not run it).
+# Start: docker compose -f docker/grafana/compose.yaml up -d
+# Datasource URL (created by hand): http://host.docker.internal:19090  (the Prometheus port-forward)
+services:
+  grafana:
+    image: grafana/grafana:13.3.0
+    container_name: grafana
+    ports: ["3000:3000"]
+    volumes: [grafana-data:/var/lib/grafana]
+    restart: unless-stopped
+volumes:
+  grafana-data:
