@@ -747,3 +747,171 @@ Gotchas:
 - The Prometheus image has no `du` or `df`, so `kubectl exec ... du -sm /prometheus` fails. Use the metrics above.
 - The restarts counted (operator 7, Prometheus 3) are from the Grafana overload of step 2, they did not grow afterwards.
 - The disk went from 17 GB to 14 GB free after the install: the images of the stack plus the PVC.
+
+## Load generator, dashboard and submission (SPEC 09, E4.4 to E4.6)
+
+### Assumptions checked on the cluster (step 1, 2026-11-09)
+
+Checked with the helper pod `k8s/data-loader-pod.yaml` and a temporary pod with `churn-base:0.3.0` that mounted `churn-data` and `churn-code`; both pods were deleted afterwards.
+
+- **`test.csv` is at `/mnt/data/raw/test.csv`** (`RAW_DIR_PVC`): 10,001 lines, that is 10,000 rows plus the header, with every column of `FEATURES`. `sample_submission.csv` and `train.csv` are in the same folder.
+- **`/mnt/data/submission.csv` does not exist yet.** The directory `/mnt/data` is `drwxrwxrwx` and `churn-base` has no `USER` line, so the pods run as root and can write there.
+- **`pandas` 3.1.0 imports** in `churn-base:0.3.0`.
+- **The endpoint answers from a pod in `kubeflow`:** `POST http://churn-predictor.kubeflow.svc.cluster.local/v1/models/churn:predict` with the first row of `test.csv` (numbers as floats, strings as strings) returned `HTTP 200` and `{"predictions":[[0.7604308402435738,0.23956915975642623]]}`. No port-forward is needed from inside the cluster.
+- **That request counts in the predictor.** It raised `request_predict_seconds_count` by 1, so the baseline of the `+100` check of step 4 is taken right before the Job, not from this step.
+- Node before the step: load average 0.35, 2298 MB available, 14 GB free on `/var`.
+
+### Load generator, local checks (step 2, 2026-11-09)
+
+`tools/load_generator.py` was checked on the laptop against a throwaway HTTP server (a Python `ThreadingHTTPServer` that answers `p1 = CreditScore / 1000`, so the answer depends on the row and the order of the answers can be proven). The 250 rows are the first rows of `data/test.csv`. The check script is not in the repo; it covers:
+
+- one pass over 250 rows sends 3 requests of 100, 100 and 50 rows, each row has the 10 features in `FEATURES` order, numbers as floats and strings as strings;
+- the file has `id,Exited`, the ids in the input order and `Exited` equal to the `p1` of that row;
+- 25 requests at 10 per second arrive with a mean gap of 0.1 s (within 10 %);
+- a server that fails twice and then answers: 2 `error` and 3 `ok` attempts, and the file is written;
+- a server that always fails: exit code 1 after 4 attempts of the first batch, no file, and a stale file that was there is gone;
+- a wrong number of rows, a value of 1.5, a `NaN` and a body that is not JSON each count as exactly one error and fail the run;
+- `GET /metrics` returns `load_requests_total{result="ok"}` and `{result="error"}` at 0 before any request, follows the counters, and answers 404 elsewhere;
+- 2 passes send 6 requests, and the file is still the one of the first pass;
+- the script imports only the standard library and `config`.
+
+Result: 24 of 24 checks passed. To run the generator locally: `PYTHONPATH=components:tools uv run python tools/load_generator.py --url <endpoint> --data data/test.csv --output /tmp/submission.csv --metrics-port 0`.
+
+### Submission check, local (step 3, 2026-11-09)
+
+```bash
+uv run python tools/check_submission.py <submission.csv> [--sample data/sample_submission.csv]
+```
+
+Exits 0 and prints one `RESULT ok` line only if the header is exactly `id,Exited`, there are 10,000 rows, the ids equal those of the sample file in the same order, and every `Exited` is a number in [0, 1]. Otherwise it prints `RESULT fail: <first violation>` and exits 1. Standard library only, so it needs no `PYTHONPATH`.
+
+Checked with `data/sample_submission.csv` (passes) and with copies written to a temporary folder (the check script is not in the repo). 17 of 17 cases gave the expected result:
+
+- **Valid:** the sample file, a file with 10,000 random probabilities, and a file with the boundary values 0 and 1.
+- **The six cases of the spec, each exit 1 naming the violation:** a missing row (`there are 9999 rows`), a changed id (`row 5 has id '99999', the sample has '15004'`), two ids swapped (the first of the two rows), a `NaN`, a value of 1.2, and a wrong header.
+- **More, each exit 1:** an extra row, text instead of a number, a negative value, an empty value, `inf`, a row with one column, a file that does not exist and an empty file.
+
+Gotcha: the check proves format, ids and range, not that row N got the prediction of row N. The order of the answers is proven by the local test of the generator (step 2), and `0.5` everywhere, as in the sample file, also passes.
+
+### Generator on the cluster, one pass (step 4, 2026-11-09)
+
+Node gate before the Job: load average 0.25, 2289 MB available, 14 GB free on `/var`, no pod outside `Running` or `Completed`.
+
+```bash
+tools/sync_code.sh                      # refreshes the ConfigMap churn-code (config.py now has the LOAD_* constants)
+kubectl create configmap load-generator -n kubeflow --from-file=load_generator.py=tools/load_generator.py \
+  --dry-run=client -o yaml | kubectl apply -f -
+kubectl delete job -n kubeflow load-generator --ignore-not-found      # a Job cannot be re-run
+sed 's|__ARGS__|"--passes", "1"|' k8s/load-generator-job.yaml | kubectl apply -f -
+```
+
+`k8s/load-generator-job.yaml` is a template, like `serving-image-check-pod.yaml`: `__ARGS__` is a flow-list body with the arguments of the script, and `sed 's|__ARGS__||'` gives the defaults (5 passes). The spec did not say how the Job gets its arguments; this keeps one file for every run.
+
+Result of the run with `--passes 1`:
+
+- The Job `Complete`d in about 72 s and the pod ended with `reason: Completed`, `exit=0`.
+- Log: `100 requests in 68.2 s = 1.47 requests/s, batch latency p50 0.011 s, p95 1.646 s, max 7.676 s`, `wrote /mnt/data/submission.csv: 10000 rows`, `done: ok 100, error 0`, and no `attempt` line (no failed attempt).
+- `request_predict_seconds_count{model_name="churn"}` went from 3 to 103 (exactly +100), measured in Prometheus 30 s after the Job.
+- Copy and check:
+
+```bash
+kubectl apply -f k8s/data-loader-pod.yaml && kubectl wait --for=condition=Ready pod/data-loader -n kubeflow --timeout=90s
+kubectl cp kubeflow/data-loader:/mnt/data/submission.csv data/submission.csv      # data/ is git-ignored
+uv run python tools/check_submission.py data/submission.csv                       # RESULT ok: 10000 rows, min 0.002677, max 0.991916
+kubectl delete pod -n kubeflow data-loader
+```
+
+- The first row of the file (`id` 15000, `0.23956915975642623`) equals the `p1` the endpoint gave for the same row in step 1.
+
+Observation: **the target rate of 2 requests per second was not held** (1.47 achieved). Most batches are fast (p50 11 ms), but a few are slow (p95 1.6 s, max 7.7 s), and being sequential, each slow one delays the rest. This is the risk of the spec about the rate; the cause of the slow batches is not known yet (a cold first request, CPU throttling of the predictor, or the scrape of Prometheus are guesses, not measured).
+
+### Prometheus scrapes the generator (step 5, 2026-11-09)
+
+```bash
+kubectl apply -f k8s/networkpolicy-allow-monitoring.yaml -f k8s/load-generator-podmonitor.yaml
+# allow-monitoring-scrape: unchanged; allow-monitoring-scrape-load-generator and PodMonitor load-generator: created
+```
+
+Node gate before each Job: load average between 0.6 and 2.1, at least 2.2 GB available.
+
+**Run of 2 passes.** The Job `Complete`d (exit 0, 200 requests, 0 errors). Prometheus saw `load_requests_total{result="ok"}` rise (97, 127, 148, 176 over the run) and `result="error"` stay at 0. The last scrape missed the tail (176 of 200), because the pod ends and nothing scrapes it again: totals on the dashboard of a short Job are a little low.
+
+**Run against a model that does not exist** (`--url .../v1/models/nope:predict --retry-pause 10`):
+
+- The log shows `removed a stale /mnt/data/submission.csv` at the start, 4 attempts that answered 404, and `FAILED: ... failed after 4 attempts`. The pod ended `Failed`, `exit=1`, and the Job `failed=1`.
+- Prometheus saw `result="error"` at 2 at 02:11:51, before the pod ended at 02:12:01 (the final value was 4, the last scrape did not catch it), and `result="ok"` at 0.
+- The PVC has neither `submission.csv` nor `submission.csv.tmp` afterwards (checked with the helper pod).
+- A successful Job after it (1 pass, 53 s, 100 ok, 0 errors) wrote the file again, and `tools/check_submission.py data/submission.csv` printed `RESULT ok` with the same min and max as before.
+
+**Time until the target is up** (first `up` sample of the pod, from `query_range`, against the start of the container):
+
+| Run | Container started | First `up=1` | Delay |
+|---|---|---|---|
+| 2 passes, PodMonitor created seconds before | 02:09:00 | 02:09:58 | 58 s |
+| bad model | 02:11:30 | 02:11:51 | 21 s |
+| 1 pass | 02:13:01 | 02:13:16 | 15 s |
+
+The first run missed the 30 s of the spec because the PodMonitor was new: the operator has to regenerate and reload the configuration of Prometheus before it discovers any pod. Once settled, the target is up in 15 to 21 s. Create the PodMonitor a minute before the first Job.
+
+Gotchas:
+
+- The `job` label of a PodMonitor target is `monitoring/load-generator` (namespace and name of the PodMonitor), not the name of the pod. To find the target of a run, filter by `pod`, for example `up{pod="load-generator-xxxxx"}`.
+- `GET /api/v1/targets` lists only live pods. After the Job ends the target is gone and `up` has one last sample at 0, so to check a past run use `query_range` on `up`, `load_requests_total` and the pod name.
+- Achieved rate in the three runs with traffic: 1.82, 1.79 and 1.87 requests per second (1.47 in the first run of step 4), with a p95 batch latency between 0.2 and 0.8 s. The slow batches vary from run to run; the cause is still not known.
+
+### Dashboard and provisioning (step 6, 2026-11-09)
+
+Files: `k8s/grafana-dashboard.json`, `docker/grafana/provisioning/datasources/prometheus.yaml`, `docker/grafana/provisioning/dashboards/dashboards.yaml`, and two new read-only mounts in `docker/grafana/compose.yaml` (`./provisioning` and the JSON).
+
+Checks before touching Grafana (port-forward `19090` open):
+
+- The JSON parses, has the `uid` `churn-serving` and 4 panels, and every panel and every target uses the datasource `uid` `prometheus-local`.
+- Each of the 4 PromQL expressions answered `status: success` on `GET /api/v1/query`. With no traffic and no Job running they gave: request rate 0, error rate no series, p50 and p95 `NaN`.
+
+Commands run by the user, then:
+
+```bash
+docker compose -f docker/grafana/compose.yaml config > /dev/null && echo "config ok"
+docker compose -f docker/grafana/compose.yaml up -d                      # recreates the container with the new mounts
+docker compose -f docker/grafana/compose.yaml logs grafana 2>&1 | grep -iE "provision|error" | tail -15
+curl -s http://localhost:3000/api/health                                 # "database": "ok", 13.3.0
+```
+
+Logs: `inserting datasource from configuration name="Prometheus (repo)" uid=prometheus-local`, and `starting to provision dashboards` followed by `finished to provision dashboards`. In the UI the folder "Churn" holds the dashboard "Churn serving", and its four panels draw the data of the earlier runs, so the provisioned datasource reaches Prometheus through `host.docker.internal:19090`.
+
+Gotchas:
+
+- **Two `level=error` lines are normal here:** `Failed to read plugin provisioning files ... provisioning/plugins` and `can't read alerting provisioning files ... provisioning/alerting`. The mount replaces Grafana's default `/etc/grafana/provisioning`, which has the optional folders `plugins` and `alerting`; ours has only `datasources` and `dashboards`. They do not affect the datasource or the dashboard (decision of the user: keep them, no empty folders).
+- The volume `grafana-data` survives the recreation, so the password and the datasource made by hand in SPEC 08 are still there next to "Prometheus (repo)".
+- The dashboard is read-only (`disableDeletion`, and the mounted file cannot be saved to). Edit `k8s/grafana-dashboard.json` and restart the container (`docker compose -f docker/grafana/compose.yaml restart`).
+
+What the panels showed after the earlier runs:
+
+- **Request rate** peaked near 2 requests per second in the 2-pass run and the 1-pass run, and fell to 0 between them.
+- **Latency of the predictor** is small: p50 about 3 ms and p95 about 8 to 9 ms. The generator saw much slower batches (p95 between 0.2 and 1.6 s, max 7.7 s). `request_predict_seconds` times only the predict step inside the server, so the slow batches are somewhere else: the rest of the request handling in the server, the network, the CPU quota of the node, or the generator itself. Not measured yet.
+- **Error rate** drew 0 % during the two successful runs and nothing for the run against the model that does not exist: its 2 errors happened before the first scrape of the new pod, so the counter showed no increase between samples (`rate` of 0 over 0). A counter of a short-lived pod loses what happens before its first scrape.
+
+### Full run with the dashboard (step 7, 2026-11-09)
+
+Node gate before the run: load average 0.81, 2288 MB available, `monitoring` restarts at 7 (operator) and 3 (Prometheus) as the baseline.
+
+```bash
+kubectl delete job -n kubeflow load-generator --ignore-not-found
+sed 's|__ARGS__||' k8s/load-generator-job.yaml | kubectl apply -f -      # defaults: 5 passes
+# dashboard open at http://localhost:3000 (Churn / Churn serving), port-forward 19090 open
+```
+
+Result: the Job `Complete`d in about 5 minutes (`ok 500, error 0`, no failed attempt, `reason: Completed`, exit 0). Achieved rate per pass: 1.44, 1.67, 1.83, 1.71 and 1.80 requests per second. `tools/check_submission.py data/submission.csv` printed `RESULT ok` (min 0.002677, max 0.991916, the same as in the earlier runs, so the served model gives the same answers).
+
+The four panels, measured with the same PromQL as the dashboard every 20 s during the run:
+
+| Panel | During the run |
+|---|---|
+| Request rate | 0.9 to 1.93 requests/s, mostly 1.5 to 1.9 |
+| Error rate | 0 % |
+| Latency p50 | about 3 ms |
+| Latency p95 | about 9 ms (a first point near 36 ms when the series starts) |
+
+After the run: no new restart in `monitoring` (still 7 and 3), load average 0.49, 2294 MB available. The screenshot is `docs/img/grafana-churn-serving.png`.
+
+Note: the rate stays under the 2 requests per second of the target (the criterion of the spec was set to 1.5 to 2). The generator is sequential and a few batches are slow (max between 3 and 16 s in the logs of the five passes), while the predictor itself reports p95 near 9 ms for its predict step, so the slow part is not that step. The cause is still not measured.

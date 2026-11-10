@@ -1,0 +1,10 @@
+# File provider (SPEC 09): loads every JSON in /etc/grafana/dashboards into the folder "Churn".
+# compose.yaml mounts k8s/grafana-dashboard.json there; edit that file in the repo, not in the UI.
+apiVersion: 1
+providers:
+  - name: churn
+    folder: Churn
+    type: file
+    disableDeletion: true
+    options:
+      path: /etc/grafana/dashboards

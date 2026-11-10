@@ -58,9 +58,9 @@ Everything runs locally on minikube (Apple Silicon Mac, Docker Desktop), on top 
 | MLflow server + PVC `mlflow-data` | `mlflow` | Experiment tracking + model registry | installed |
 | InferenceService `churn` | `kubeflow` | Serves the champion from `pvc://churn-data/models/churn/vN` | created and patched by Pipeline 2 |
 | ServingRuntime `churn-sklearnserver` | `kubeflow` | Copy of KServe's `kserve-sklearnserver` runtime that uses the image `churn-sklearnserver` | installed (`k8s/serving-runtime.yaml`) |
-| Load generator (Job) | `kubeflow` | Replays `test.csv`, writes `submission.csv` | to write |
+| Load generator (Job) | `kubeflow` | Replays `test.csv` (100 rows per request, one at a time, about 1.7 requests/s measured), writes `submission.csv` and serves `load_requests_total` while it runs; scraped through a `PodMonitor` | installed (`k8s/load-generator-job.yaml`, `tools/load_generator.py`) |
 | Prometheus | `monitoring` | Serving metrics (Helm, `kube-prometheus-stack` 92.22.0, no Alertmanager) | installed, scrapes the predictor |
-| Grafana | container on the laptop (`docker/grafana/compose.yaml`) | Dashboard, reads Prometheus through a port-forward | installed, dashboard in SPEC 09 |
+| Grafana | container on the laptop (`docker/grafana/compose.yaml`) | Dashboard, reads Prometheus through a port-forward | installed; the dashboard `k8s/grafana-dashboard.json` is provisioned from the repo |
 | Image `churn-base` | — | Python + pinned scikit-learn, mlflow, optuna, pandas, joblib, kfp, xgboost, lightgbm | installed (`0.3.0`) |
 | Image `churn-sklearnserver` | — | `kserve/sklearnserver:v0.21.0` plus `xgboost 3.2.0`, `lightgbm 4.7.0` and `narwhals` (which `lightgbm` requires), so a champion of any family loads | installed (`0.1.0`) |
 
@@ -70,7 +70,7 @@ Everything runs locally on minikube (Apple Silicon Mac, Docker Desktop), on top 
 1. **You** copy the CSVs to `churn-data` (helper pod + `kubectl cp`) and submit Pipeline 1 with the `kfp` SDK.
 2. **Pipeline 1** reads data from the PVC. Each tuning pod runs an Optuna study for one model family; every trial is a nested run in **MLflow** under the family's parent run, which also logs the best params and the CV metrics (no model: only Register logs one). Evaluate refits each family's best config on train, scores the hold-out next to a `DummyClassifier` baseline, logs the hold-out metrics in each family's parent run and tags the winner (best CV AUC) with `winner=true`; Evaluate logs no model. The Gate compares the winner's hold-out AUC with the Dummy baseline and the current champion and tags the winner's run `gate=passed` or `gate=rejected`. If it passes, Register refits the best config on train + hold-out, logs the model (the only model logged in the pipeline), registers it as `churn`, tags the version with the pre-refit hold-out AUC and only then sets the alias `@champion`.
 3. **Pipeline 2** (manual run) loads `models:/churn@champion`, saves it as `model.joblib` on the PVC, creates/updates the **InferenceService** and waits until the new pod answers and the old one is gone, and smoke-tests that `:predict` returns the probabilities of that exact model (it compares the answer with the saved file).
-4. The **load generator** sends `test.csv` rows to the endpoint and writes `submission.csv`; **Prometheus** scrapes the serving metrics and **Grafana** shows them.
+4. The **load generator** sends `test.csv` rows to the endpoint and writes `submission.csv`, which `tools/check_submission.py` checks on the laptop; **Prometheus** scrapes the serving metrics (and the generator's own counters), and the provisioned **Grafana** dashboard shows request rate, p50 and p95 latency and a client-side error rate.
 
 ### Model handoff: MLflow → KServe
 - Pipeline 1 logs with `mlflow.sklearn.log_model(...)` (standard MLflow format with signature and input example) and registers it. The registry stays the single source of truth and keeps the lineage (run, params, metrics).
@@ -139,7 +139,7 @@ Total ≈ 9–10 h. No scope cuts; the deadline moves instead.
 - **XGBoost and LightGBM champions could not be served — solved (SPEC 07):** the KServe `sklearnserver:v0.21.0` image has neither library, so a registered `Pipeline` with one of them failed to load (`ModuleNotFoundError`, seen in the check of step 4). The derived image `churn-sklearnserver:0.1.0` adds `xgboost 3.2.0`, `lightgbm 4.7.0` and `narwhals` (required by `lightgbm`), and loads a model of each of the five families with a difference of 0 in `predict_proba`. A real XGBoost or LightGBM champion has not been deployed yet, because today's champion is `hist_gradient_boosting`.
 - **scikit-learn version pinning:** read the version from the KServe 0.21 sklearnserver image before building `churn-base`.
 - **SQLite under parallel writes:** possible `database is locked` with concurrent tuning runs (Optuna adds one MLflow run per trial, ~90 runs per pipeline run). Mitigation: parallelism 2 and client retries; fallback Postgres.
-- **Metrics from KServe sklearn server:** solved. v0.21 exposes `/metrics` on port 8080 (histograms `request_*_seconds`), and Prometheus scrapes it through a `ServiceMonitor` on the Service. It has no metric with an HTTP status, so the error rate is decided in SPEC 09.
+- **Metrics from KServe sklearn server:** solved. v0.21 exposes `/metrics` on port 8080 (histograms `request_*_seconds`), and Prometheus scrapes it through a `ServiceMonitor` on the Service. It has no metric with an HTTP status, so the error rate comes from the load generator (`load_requests_total{result="ok|error"}`, SPEC 09): a client-side rate that exists only while a generator Job runs.
 - **RBAC for Pipeline 2 — solved (SPEC 07):** `k8s/rbac-pipeline-runner.yaml` adds a Role `pipeline-runner-serving` (get, create, patch on `inferenceservices`; get, list on `servingruntimes`; no delete) and its RoleBinding to `pipeline-runner`. The existing Role `pipeline-runner` stays as it was. Reading the predictor Deployment and pods, which Publish also does, was already allowed by that existing Role.
 - **A KServe rollout can look finished before it is (found in SPEC 07):** after a `patch`, the InferenceService stays `Ready`, and `observedGeneration` can catch up, while the new pod is not Ready and the old one is the only one answering. Publish therefore also waits for the Deployment rollout. See `docs/runbook.md` for the measurements.
 - **The KFP flake is still open:** the drivers and launchers of KFP time out against `metadata-grpc` (`i/o timeout`): 8 of 9 attempts failed that way in one session (2026-11-06), and the cause is not known. A failed run is retried; see `docs/runbook.md`.
@@ -155,15 +155,18 @@ portafolio/kubeflow/
 ├── architecture.svg
 ├── .gitignore                 # data, venvs, local outputs
 ├── data/                      # train.csv  test.csv  sample_submission.csv (git-ignored)
-├── docker/churn-base/         # Dockerfile + requirements.txt (pinned)
-├── k8s/                       # PVC, MLflow, InferenceService, load-generator Job, Helm values
+├── docker/
+│   ├── churn-base/            # Dockerfile + requirements.txt (pinned)
+│   ├── churn-sklearnserver/   # derived KServe sklearn server image
+│   └── grafana/               # compose.yaml and provisioning/ (datasource, dashboard provider)
+├── k8s/                       # PVC, MLflow, ServingRuntime, RBAC, Helm values, ServiceMonitor, PodMonitor, NetworkPolicies, load-generator Job, grafana-dashboard.json
 ├── notebooks/eda.ipynb        # exploratory analysis, committed with aggregated outputs only
 ├── components/                # KFP components: ingest, preprocess, load_config, tune, evaluate, register, fetch, publish, smoke_test; shared code in config.py, preprocessing.py, models.py and tuning_config.json
 ├── pipelines/
 │   ├── training_pipeline.py   # Pipeline 1
 │   └── deploy_pipeline.py     # Pipeline 2
-├── tools/load_generator.py
-└── docs/runbook.md
+├── tools/                     # load_generator.py, check_submission.py, submit_pipeline.py, sync_code.sh, baseline and spike scripts
+└── docs/                      # runbook.md, eda-summary.md, img/ (screenshots)
 ```
 
 ## 9. Review checklist (for iterating)

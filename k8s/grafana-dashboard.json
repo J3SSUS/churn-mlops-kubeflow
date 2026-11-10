@@ -1,0 +1,87 @@
+{
+  "uid": "churn-serving",
+  "title": "Churn serving",
+  "description": "Serving metrics of the churn predictor (request rate and latency, from Prometheus) and the client-side error rate of the load generator. SPEC 09.",
+  "tags": ["churn", "serving"],
+  "timezone": "browser",
+  "editable": true,
+  "graphTooltip": 1,
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "time": {"from": "now-15m", "to": "now"},
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Request rate",
+      "description": "Predict requests per second received by the predictor, from request_predict_seconds_count. The series exists only after the first request.",
+      "datasource": {"type": "prometheus", "uid": "prometheus-local"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus-local"},
+          "refId": "A",
+          "legendFormat": "requests/s",
+          "expr": "sum(rate(request_predict_seconds_count{model_name=\"churn\"}[1m]))"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "reqps", "min": 0, "custom": {"lineWidth": 2, "fillOpacity": 10}}, "overrides": []},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi", "sort": "none"}}
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Error rate (client-side, load generator only)",
+      "description": "Share of failed attempts of the load generator, from load_requests_total. It is NOT a server metric: the predictor exposes no HTTP status. It has data only while a generator Job runs.",
+      "datasource": {"type": "prometheus", "uid": "prometheus-local"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus-local"},
+          "refId": "A",
+          "legendFormat": "errors",
+          "expr": "100 * sum(rate(load_requests_total{result=\"error\"}[1m])) / sum(rate(load_requests_total[1m]))"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "percent", "min": 0, "max": 100, "custom": {"lineWidth": 2, "fillOpacity": 10}}, "overrides": []},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi", "sort": "none"}}
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Latency p50",
+      "description": "Median time of the predict step in the predictor, from the histogram request_predict_seconds.",
+      "datasource": {"type": "prometheus", "uid": "prometheus-local"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus-local"},
+          "refId": "A",
+          "legendFormat": "p50",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(request_predict_seconds_bucket{model_name=\"churn\"}[1m])))"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "s", "min": 0, "custom": {"lineWidth": 2, "fillOpacity": 10}}, "overrides": []},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi", "sort": "none"}}
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Latency p95",
+      "description": "95th percentile of the time of the predict step in the predictor, from the histogram request_predict_seconds.",
+      "datasource": {"type": "prometheus", "uid": "prometheus-local"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus-local"},
+          "refId": "A",
+          "legendFormat": "p95",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(request_predict_seconds_bucket{model_name=\"churn\"}[1m])))"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "s", "min": 0, "custom": {"lineWidth": 2, "fillOpacity": 10}}, "overrides": []},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi", "sort": "none"}}
+    }
+  ]
+}

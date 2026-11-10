@@ -20,3 +20,22 @@ spec:
               kubernetes.io/metadata.name: monitoring
       ports:
         - {protocol: TCP, port: 8080}
+---
+# Same idea for the load generator Job pod (SPEC 09): Prometheus reaches its /metrics on TCP 9100.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-monitoring-scrape-load-generator
+  namespace: kubeflow
+spec:
+  podSelector:
+    matchLabels:
+      app: load-generator
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - {protocol: TCP, port: 9100}
