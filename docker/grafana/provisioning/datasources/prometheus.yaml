@@ -1,0 +1,12 @@
+# Datasource provisioned from the repo (SPEC 09). The uid is fixed so the dashboard JSON can name it.
+# It reads Prometheus through the port-forward 19090 of the laptop, seen from the container as
+# host.docker.internal. The name differs from the datasource made by hand in SPEC 08, so they do not collide.
+apiVersion: 1
+datasources:
+  - name: "Prometheus (repo)"
+    uid: prometheus-local
+    type: prometheus
+    access: proxy
+    url: http://host.docker.internal:19090
+    isDefault: false
+    editable: false
