@@ -792,3 +792,35 @@ Checked with `data/sample_submission.csv` (passes) and with copies written to a 
 - **More, each exit 1:** an extra row, text instead of a number, a negative value, an empty value, `inf`, a row with one column, a file that does not exist and an empty file.
 
 Gotcha: the check proves format, ids and range, not that row N got the prediction of row N. The order of the answers is proven by the local test of the generator (step 2), and `0.5` everywhere, as in the sample file, also passes.
+
+### Generator on the cluster, one pass (step 4, 2026-11-09)
+
+Node gate before the Job: load average 0.25, 2289 MB available, 14 GB free on `/var`, no pod outside `Running` or `Completed`.
+
+```bash
+tools/sync_code.sh                      # refreshes the ConfigMap churn-code (config.py now has the LOAD_* constants)
+kubectl create configmap load-generator -n kubeflow --from-file=load_generator.py=tools/load_generator.py \
+  --dry-run=client -o yaml | kubectl apply -f -
+kubectl delete job -n kubeflow load-generator --ignore-not-found      # a Job cannot be re-run
+sed 's|__ARGS__|"--passes", "1"|' k8s/load-generator-job.yaml | kubectl apply -f -
+```
+
+`k8s/load-generator-job.yaml` is a template, like `serving-image-check-pod.yaml`: `__ARGS__` is a flow-list body with the arguments of the script, and `sed 's|__ARGS__||'` gives the defaults (5 passes). The spec did not say how the Job gets its arguments; this keeps one file for every run.
+
+Result of the run with `--passes 1`:
+
+- The Job `Complete`d in about 72 s and the pod ended with `reason: Completed`, `exit=0`.
+- Log: `100 requests in 68.2 s = 1.47 requests/s, batch latency p50 0.011 s, p95 1.646 s, max 7.676 s`, `wrote /mnt/data/submission.csv: 10000 rows`, `done: ok 100, error 0`, and no `attempt` line (no failed attempt).
+- `request_predict_seconds_count{model_name="churn"}` went from 3 to 103 (exactly +100), measured in Prometheus 30 s after the Job.
+- Copy and check:
+
+```bash
+kubectl apply -f k8s/data-loader-pod.yaml && kubectl wait --for=condition=Ready pod/data-loader -n kubeflow --timeout=90s
+kubectl cp kubeflow/data-loader:/mnt/data/submission.csv data/submission.csv      # data/ is git-ignored
+uv run python tools/check_submission.py data/submission.csv                       # RESULT ok: 10000 rows, min 0.002677, max 0.991916
+kubectl delete pod -n kubeflow data-loader
+```
+
+- The first row of the file (`id` 15000, `0.23956915975642623`) equals the `p1` the endpoint gave for the same row in step 1.
+
+Observation: **the target rate of 2 requests per second was not held** (1.47 achieved). Most batches are fast (p50 11 ms), but a few are slow (p95 1.6 s, max 7.7 s), and being sequential, each slow one delays the rest. This is the risk of the spec about the rate; the cause of the slow batches is not known yet (a cold first request, CPU throttling of the predictor, or the scrape of Prometheus are guesses, not measured).

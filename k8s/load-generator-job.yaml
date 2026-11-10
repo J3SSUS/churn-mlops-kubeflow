@@ -1,0 +1,52 @@
+# Load generator Job (SPEC 09, E4.4): replays test.csv against the churn endpoint, writes
+# /mnt/data/submission.csv and serves load_requests_total on port 9100 while it runs.
+# A Job cannot be re-run: delete it and create it again for every run. __ARGS__ is a flow-list body
+# with the arguments of tools/load_generator.py; empty means the defaults of config.py (5 passes).
+#   kubectl delete job -n kubeflow load-generator --ignore-not-found
+#   sed 's|__ARGS__||' k8s/load-generator-job.yaml | kubectl apply -f -
+#   sed 's|__ARGS__|"--passes", "1"|' k8s/load-generator-job.yaml | kubectl apply -f -
+# The script comes from the ConfigMap load-generator and config.py from churn-code (tools/sync_code.sh):
+#   kubectl create configmap load-generator -n kubeflow --from-file=load_generator.py=tools/load_generator.py \
+#     --dry-run=client -o yaml | kubectl apply -f -
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: load-generator
+  namespace: kubeflow
+spec:
+  backoffLimit: 0               # a failed run is looked at, not repeated
+  activeDeadlineSeconds: 900
+  template:
+    metadata:
+      labels:
+        app: load-generator
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: generator
+          image: churn-base:0.3.0
+          imagePullPolicy: IfNotPresent
+          command: ["python", "/generator/load_generator.py"]
+          args: [__ARGS__]
+          env:
+            - {name: PYTHONPATH, value: /code}
+            - {name: OMP_NUM_THREADS, value: "1"}
+          ports:
+            - {name: metrics, containerPort: 9100}
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+            limits: {memory: 512Mi}
+          volumeMounts:
+            - {name: data, mountPath: /mnt/data}
+            - {name: code, mountPath: /code}
+            - {name: generator, mountPath: /generator}
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: churn-data
+        - name: code
+          configMap:
+            name: churn-code
+        - name: generator
+          configMap:
+            name: load-generator
