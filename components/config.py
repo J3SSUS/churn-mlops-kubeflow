@@ -27,3 +27,12 @@ SERVING_RUNTIME_NAME = "churn-sklearnserver"
 PUBLISH_TIMEOUT_S = 300                       # how long Publish waits for Ready
 SMOKE_ROWS = 3
 SMOKE_TOLERANCE = 1e-6                        # max |endpoint - local predict_proba|
+
+# Load generator (SPEC 09). Defaults of the arguments of tools/load_generator.py; the Job can override them.
+SUBMISSION_PATH = "/mnt/data/submission.csv"  # on the PVC, written by the load generator
+LOAD_BATCH_SIZE = 100                         # rows per request
+LOAD_RATE_RPS = 2.0                           # requests per second, one at a time
+LOAD_PASSES = 5                               # passes over test.csv; only the first keeps predictions
+LOAD_RETRIES = 3                              # attempts per batch after the first one
+LOAD_RETRY_PAUSE_S = 2.0                      # pause between attempts of the same batch
+LOAD_METRICS_PORT = 9100                      # /metrics of the generator

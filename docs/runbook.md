@@ -760,3 +760,19 @@ Checked with the helper pod `k8s/data-loader-pod.yaml` and a temporary pod with 
 - **The endpoint answers from a pod in `kubeflow`:** `POST http://churn-predictor.kubeflow.svc.cluster.local/v1/models/churn:predict` with the first row of `test.csv` (numbers as floats, strings as strings) returned `HTTP 200` and `{"predictions":[[0.7604308402435738,0.23956915975642623]]}`. No port-forward is needed from inside the cluster.
 - **That request counts in the predictor.** It raised `request_predict_seconds_count` by 1, so the baseline of the `+100` check of step 4 is taken right before the Job, not from this step.
 - Node before the step: load average 0.35, 2298 MB available, 14 GB free on `/var`.
+
+### Load generator, local checks (step 2, 2026-11-09)
+
+`tools/load_generator.py` was checked on the laptop against a throwaway HTTP server (a Python `ThreadingHTTPServer` that answers `p1 = CreditScore / 1000`, so the answer depends on the row and the order of the answers can be proven). The 250 rows are the first rows of `data/test.csv`. The check script is not in the repo; it covers:
+
+- one pass over 250 rows sends 3 requests of 100, 100 and 50 rows, each row has the 10 features in `FEATURES` order, numbers as floats and strings as strings;
+- the file has `id,Exited`, the ids in the input order and `Exited` equal to the `p1` of that row;
+- 25 requests at 10 per second arrive with a mean gap of 0.1 s (within 10 %);
+- a server that fails twice and then answers: 2 `error` and 3 `ok` attempts, and the file is written;
+- a server that always fails: exit code 1 after 4 attempts of the first batch, no file, and a stale file that was there is gone;
+- a wrong number of rows, a value of 1.5, a `NaN` and a body that is not JSON each count as exactly one error and fail the run;
+- `GET /metrics` returns `load_requests_total{result="ok"}` and `{result="error"}` at 0 before any request, follows the counters, and answers 404 elsewhere;
+- 2 passes send 6 requests, and the file is still the one of the first pass;
+- the script imports only the standard library and `config`.
+
+Result: 24 of 24 checks passed. To run the generator locally: `PYTHONPATH=components:tools uv run python tools/load_generator.py --url <endpoint> --data data/test.csv --output /tmp/submission.csv --metrics-port 0`.
