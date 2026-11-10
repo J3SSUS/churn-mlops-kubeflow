@@ -59,7 +59,8 @@ Everything runs locally on minikube (Apple Silicon Mac, Docker Desktop), on top 
 | InferenceService `churn` | `kubeflow` | Serves the champion from `pvc://churn-data/models/churn/vN` | created and patched by Pipeline 2 |
 | ServingRuntime `churn-sklearnserver` | `kubeflow` | Copy of KServe's `kserve-sklearnserver` runtime that uses the image `churn-sklearnserver` | installed (`k8s/serving-runtime.yaml`) |
 | Load generator (Job) | `kubeflow` | Replays `test.csv`, writes `submission.csv` | to write |
-| Prometheus + Grafana | `monitoring` | Serving metrics and dashboard (Helm) | to install |
+| Prometheus | `monitoring` | Serving metrics (Helm, `kube-prometheus-stack` 92.22.0, no Alertmanager) | installed, scrapes the predictor |
+| Grafana | container on the laptop (`docker/grafana/compose.yaml`) | Dashboard, reads Prometheus through a port-forward | installed, dashboard in SPEC 09 |
 | Image `churn-base` | — | Python + pinned scikit-learn, mlflow, optuna, pandas, joblib, kfp, xgboost, lightgbm | installed (`0.3.0`) |
 | Image `churn-sklearnserver` | — | `kserve/sklearnserver:v0.21.0` plus `xgboost 3.2.0`, `lightgbm 4.7.0` and `narwhals` (which `lightgbm` requires), so a champion of any family loads | installed (`0.1.0`) |
 
@@ -107,8 +108,8 @@ Pipeline([
 | Model handoff | Registry → `joblib` on PVC → KServe `storageUri: pvc://churn-data/…` | Same pattern that worked in Ch08; avoids S3 credentials |
 | Probabilities | `PREDICT_PROBA=true` env var on the sklearn predictor | `:predict` returns labels by default; submission needs probabilities (to verify in Phase 0) |
 | Images | `churn-base` (scikit-learn, mlflow, optuna, pandas, joblib, kfp, xgboost, lightgbm) for the pipeline steps, and `churn-sklearnserver` (the KServe sklearn server plus xgboost, lightgbm) for serving, both built with `minikube image build` | No `pip install` at every step; pins the sklearn version; the stock server image cannot load XGBoost or LightGBM models |
-| Monitoring install | Helm (`kube-prometheus-stack`), install Helm with `brew install helm` | Standard way; Helm is not installed yet |
-| Cluster memory | Keep minikube at 6 GB for now | 15k rows is light; revisit if the monitoring stack gets tight |
+| Monitoring install | Helm (`kube-prometheus-stack`), install Helm with `brew install helm` | Standard way; Helm 4.3.1 installed. Grafana runs outside the cluster (see SPEC 08) |
+| Cluster memory | Keep minikube at 6 GB for now | 15k rows is light. Measured after the monitoring install: node of 7.8 GB with about 2.3 GB available and 14 GB of disk free |
 
 ## 6. Phases and acceptance criteria
 
@@ -138,11 +139,11 @@ Total ≈ 9–10 h. No scope cuts; the deadline moves instead.
 - **XGBoost and LightGBM champions could not be served — solved (SPEC 07):** the KServe `sklearnserver:v0.21.0` image has neither library, so a registered `Pipeline` with one of them failed to load (`ModuleNotFoundError`, seen in the check of step 4). The derived image `churn-sklearnserver:0.1.0` adds `xgboost 3.2.0`, `lightgbm 4.7.0` and `narwhals` (required by `lightgbm`), and loads a model of each of the five families with a difference of 0 in `predict_proba`. A real XGBoost or LightGBM champion has not been deployed yet, because today's champion is `hist_gradient_boosting`.
 - **scikit-learn version pinning:** read the version from the KServe 0.21 sklearnserver image before building `churn-base`.
 - **SQLite under parallel writes:** possible `database is locked` with concurrent tuning runs (Optuna adds one MLflow run per trial, ~90 runs per pipeline run). Mitigation: parallelism 2 and client retries; fallback Postgres.
-- **Metrics from KServe sklearn server:** unverified that v0.21 exposes Prometheus metrics in Standard mode. First check in Phase 3; fallback is the custom predictor exporting request count and latency.
+- **Metrics from KServe sklearn server:** solved. v0.21 exposes `/metrics` on port 8080 (histograms `request_*_seconds`), and Prometheus scrapes it through a `ServiceMonitor` on the Service. It has no metric with an HTTP status, so the error rate is decided in SPEC 09.
 - **RBAC for Pipeline 2 — solved (SPEC 07):** `k8s/rbac-pipeline-runner.yaml` adds a Role `pipeline-runner-serving` (get, create, patch on `inferenceservices`; get, list on `servingruntimes`; no delete) and its RoleBinding to `pipeline-runner`. The existing Role `pipeline-runner` stays as it was. Reading the predictor Deployment and pods, which Publish also does, was already allowed by that existing Role.
 - **A KServe rollout can look finished before it is (found in SPEC 07):** after a `patch`, the InferenceService stays `Ready`, and `observedGeneration` can catch up, while the new pod is not Ready and the old one is the only one answering. Publish therefore also waits for the Deployment rollout. See `docs/runbook.md` for the measurements.
 - **The KFP flake is still open:** the drivers and launchers of KFP time out against `metadata-grpc` (`i/o timeout`): 8 of 9 attempts failed that way in one session (2026-11-06), and the cause is not known. A failed run is retried; see `docs/runbook.md`.
-- **Memory:** MLflow + Prometheus + Grafana on top of KFP and KServe in a 6 GB node may not fit. Fallback: raise Docker Desktop to ~10 GB and restart minikube with `--memory=8192`.
+- **Memory:** MLflow + Prometheus + Grafana on top of KFP and KServe may not fit. Measured: Prometheus and its operator fit (node at about 2.3 GB available), but Grafana 13 inside the cluster overloaded the node (load average 254, restart loop), so it runs in a container on the laptop.
 - **Competition metric:** to be confirmed on the Kaggle Evaluation tab.
 
 ## 8. Repo layout

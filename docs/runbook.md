@@ -727,3 +727,23 @@ kubectl apply -f k8s/networkpolicy-allow-monitoring.yaml
 The `ServiceMonitor` alone left the target `down` (`Get "http://10.244.0.30:8080/metrics": context deadline exceeded`, scrape timeout of 10 s) even though the labels and the port name matched and `/metrics` answered in 38 ms through a port-forward.
 
 Gotcha: **the namespace `kubeflow` has a `NetworkPolicy` `default-allow-same-namespace`** (`podSelector: {}`, ingress only from the same namespace), enforced by kindnet. A pod in another namespace, like Prometheus in `monitoring`, is dropped silently: no error, only a timeout. `k8s/networkpolicy-allow-monitoring.yaml` adds a second policy that opens TCP 8080 of the predictor pods (`component=predictor`) to the namespace `monitoring`. Policies add up, so the existing one is untouched. After applying it the target was `up` on the first check. To diagnose this again: compare the time of `/metrics` through a port-forward (it goes through the node, not the pod network) with the scrape error, and run `kubectl get networkpolicy -A`.
+
+### Final measurement after 10 minutes (step 6, 2026-11-09)
+
+Taken 10 minutes after the check of step 5, with the target `churn-predictor` scraping every 15 s and no other traffic.
+
+| Measure | Before the install | After 10 minutes |
+|---|---|---|
+| Node memory (`minikube ssh -- free -m`) | 7834 total, 4810 used, 3023 available | 5510 used, 2323 available |
+| Node disk (`minikube ssh -- df -h /var`) | 17 GB free (70 %) | 14 GB free (77 %) |
+| Load average (1 / 5 / 15 min) | 254 at the worst (Grafana inside the cluster) | 0.32 / 1.32 / 20.0 (the 15 min value still holds the incident) |
+| Restarts in `monitoring` | none yet | operator 7, Prometheus 3: the same as before the 10 minutes, so no new restart |
+| Target `up{job="churn-predictor"}` | n/a | 1 |
+| Data of Prometheus | n/a | about 1.1 MB (WAL 976 KB, head chunks 128 KB, 1846 series) |
+
+Gotchas:
+
+- `prometheus_tsdb_storage_blocks_bytes` is `0` in the first hours. Prometheus keeps the recent data in the WAL and the head, and writes the first block only after about 2 h. To size the data early, add `prometheus_tsdb_wal_storage_size_bytes` and `prometheus_tsdb_head_chunks_storage_size_bytes`.
+- The Prometheus image has no `du` or `df`, so `kubectl exec ... du -sm /prometheus` fails. Use the metrics above.
+- The restarts counted (operator 7, Prometheus 3) are from the Grafana overload of step 2, they did not grow afterwards.
+- The disk went from 17 GB to 14 GB free after the install: the images of the stack plus the PVC.
