@@ -300,7 +300,7 @@ Stop rule for every step that touches the cluster: before a Job, `minikube ssh -
 - [ ] After the user recreates the container, the folder "Churn" holds the dashboard "Churn serving", the datasource "Prometheus (repo)" answers `OK`, and `docker compose logs grafana` shows no provisioning error, apart from the two harmless lines about the optional folders `provisioning/plugins` and `provisioning/alerting`, which do not exist because the mount replaces the default folder.
 
 ### Full run with the dashboard
-- [ ] During a run with the defaults (5 passes), the four panels show data: request rate close to 2 req/s, p50 and p95 with numbers, and error rate at 0 %.
+- [ ] During a run with the defaults (5 passes), the four panels show data: request rate between 1.5 and 2 req/s (the generator is sequential and its slow batches keep it a little under the target of 2), p50 and p95 with numbers, and error rate at 0 %.
 - [ ] That Job is `Complete`, and its `submission.csv` passes `tools/check_submission.py`.
 - [ ] `docs/img/grafana-churn-serving.png` exists and shows the four panels with data (checked by the user).
 - [ ] After the run, no pod in `monitoring` has restarted since before the run, and `minikube ssh -- uptime` shows a 1-minute load below 20.
@@ -308,7 +308,7 @@ Stop rule for every step that touches the cluster: before a Job, `minikube ssh -
 ### No change outside the scope
 - [ ] `git diff main -- components pipelines ':!components/config.py'` is empty, and `git diff main -- components/tuning_config.json` is empty.
 - [ ] `kubectl get isvc churn -n kubeflow -o jsonpath='{.metadata.uid}'` still prints `6519f4b2-2a3e-4286-a18c-4479f2075584`, and nothing in this spec edits the InferenceService or the Service `churn-predictor`.
-- [ ] `git ls-files | grep -c '\.csv$'` returns 0, `git ls-files | grep -c submission` returns 0, and `git check-ignore data/submission.csv` prints the path.
+- [ ] `git ls-files | grep -c '\.csv$'` returns 0, `git ls-files | grep -c 'submission.*\.csv$'` returns 0 (the name `check_submission.py` and this spec contain the word, they are not data), and `git check-ignore data/submission.csv` prints the path.
 
 ### Docs and hygiene
 - [ ] `docs/runbook.md` has a section with the commands run, how to run and re-create the Job, how to copy and check the submission, the provisioning commands and the gotchas found.

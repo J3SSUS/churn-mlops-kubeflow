@@ -890,3 +890,28 @@ What the panels showed after the earlier runs:
 - **Request rate** peaked near 2 requests per second in the 2-pass run and the 1-pass run, and fell to 0 between them.
 - **Latency of the predictor** is small: p50 about 3 ms and p95 about 8 to 9 ms. The generator saw much slower batches (p95 between 0.2 and 1.6 s, max 7.7 s). `request_predict_seconds` times only the predict step inside the server, so the slow batches are somewhere else: the rest of the request handling in the server, the network, the CPU quota of the node, or the generator itself. Not measured yet.
 - **Error rate** drew 0 % during the two successful runs and nothing for the run against the model that does not exist: its 2 errors happened before the first scrape of the new pod, so the counter showed no increase between samples (`rate` of 0 over 0). A counter of a short-lived pod loses what happens before its first scrape.
+
+### Full run with the dashboard (step 7, 2026-11-09)
+
+Node gate before the run: load average 0.81, 2288 MB available, `monitoring` restarts at 7 (operator) and 3 (Prometheus) as the baseline.
+
+```bash
+kubectl delete job -n kubeflow load-generator --ignore-not-found
+sed 's|__ARGS__||' k8s/load-generator-job.yaml | kubectl apply -f -      # defaults: 5 passes
+# dashboard open at http://localhost:3000 (Churn / Churn serving), port-forward 19090 open
+```
+
+Result: the Job `Complete`d in about 5 minutes (`ok 500, error 0`, no failed attempt, `reason: Completed`, exit 0). Achieved rate per pass: 1.44, 1.67, 1.83, 1.71 and 1.80 requests per second. `tools/check_submission.py data/submission.csv` printed `RESULT ok` (min 0.002677, max 0.991916, the same as in the earlier runs, so the served model gives the same answers).
+
+The four panels, measured with the same PromQL as the dashboard every 20 s during the run:
+
+| Panel | During the run |
+|---|---|
+| Request rate | 0.9 to 1.93 requests/s, mostly 1.5 to 1.9 |
+| Error rate | 0 % |
+| Latency p50 | about 3 ms |
+| Latency p95 | about 9 ms (a first point near 36 ms when the series starts) |
+
+After the run: no new restart in `monitoring` (still 7 and 3), load average 0.49, 2294 MB available. The screenshot is `docs/img/grafana-churn-serving.png`.
+
+Note: the rate stays under the 2 requests per second of the target (the criterion of the spec was set to 1.5 to 2). The generator is sequential and a few batches are slow (max between 3 and 16 s in the logs of the five passes), while the predictor itself reports p95 near 9 ms for its predict step, so the slow part is not that step. The cause is still not measured.
